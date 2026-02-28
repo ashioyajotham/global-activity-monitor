@@ -1,0 +1,19 @@
+{
+  "name": "global-activity-monitor",
+  "version": "1.0.0",
+  "description": "Real-time world map tracking global activities and geopolitical situations",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3",
+    "node-summarizer": "^1.0.7",
+    "rss-parser": "^3.13.0",
+    "sentiment": "^5.0.2",
+    "ws": "^8.18.0"
+  }
+}

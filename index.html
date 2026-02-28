@@ -1,0 +1,1935 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global Activity Monitor</title>
+    <meta name="description"
+        content="Real-time world map tracking global activities and geopolitical situations with visual status indicators.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <style>
+        /* ── Reset & Base ───────────────────────────────────── */
+        *,
+        *::before,
+        *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #080808;
+            --bg-surface: #0f0f0f;
+            --bg-card: #161616;
+            --bg-elevated: #1c1c1c;
+            --border-subtle: #222222;
+            --border-muted: #2a2a2a;
+            --text-primary: #e8e8e8;
+            --text-secondary: #999999;
+            --text-muted: #555555;
+            --green-active: #22c55e;
+            --green-glow: rgba(34, 197, 94, 0.4);
+            --green-dim: rgba(34, 197, 94, 0.15);
+            --red-active: #ef4444;
+            --red-glow: rgba(239, 68, 68, 0.4);
+            --red-dim: rgba(239, 68, 68, 0.15);
+            --amber-active: #f59e0b;
+            --amber-glow: rgba(245, 158, 11, 0.4);
+            --amber-dim: rgba(245, 158, 11, 0.15);
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+        }
+
+        html,
+        body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Noise Overlay ──────────────────────────────────── */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            opacity: 0.03;
+            pointer-events: none;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+            background-size: 256px 256px;
+        }
+
+        /* ── Header ─────────────────────────────────────────── */
+        .header {
+            position: relative;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 24px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .header-logo {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green-active);
+            box-shadow: 0 0 8px var(--green-glow);
+            animation: pulse-green 2s ease-in-out infinite;
+        }
+
+        .header-title {
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .header-stat {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+        }
+
+        .header-stat .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        /* ── Notification Bell ─────────────────────────────── */
+        .notif-bell {
+            position: relative;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            border: 1px solid var(--border-subtle);
+            background: transparent;
+            transition: all 0.2s;
+            color: var(--text-muted);
+        }
+
+        .notif-bell:hover {
+            background: var(--bg-card);
+            border-color: var(--border-muted);
+            color: var(--text-secondary);
+        }
+
+        .notif-bell svg {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+        }
+
+        .notif-bell.has-alerts {
+            animation: bell-ring 0.5s ease-in-out;
+            color: var(--red-active);
+            border-color: var(--red-dim);
+        }
+
+        @keyframes bell-ring {
+
+            0%,
+            100% {
+                transform: rotate(0);
+            }
+
+            15% {
+                transform: rotate(12deg);
+            }
+
+            30% {
+                transform: rotate(-10deg);
+            }
+
+            45% {
+                transform: rotate(8deg);
+            }
+
+            60% {
+                transform: rotate(-6deg);
+            }
+
+            75% {
+                transform: rotate(3deg);
+            }
+        }
+
+        .notif-badge {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            min-width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            background: var(--red-active);
+            color: #fff;
+            font-size: 9px;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 4px;
+            display: none;
+            box-shadow: 0 0 8px var(--red-glow);
+        }
+
+        .notif-badge.visible {
+            display: flex;
+        }
+
+        /* ── Notification Dropdown ─────────────────────────── */
+        .notif-dropdown {
+            position: absolute;
+            top: calc(100% + 8px);
+            right: 0;
+            width: 320px;
+            max-height: 400px;
+            overflow-y: auto;
+            background: var(--bg-card);
+            border: 1px solid var(--border-muted);
+            border-radius: 8px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            z-index: 100;
+            display: none;
+            backdrop-filter: blur(20px);
+        }
+
+        .notif-dropdown.open {
+            display: block;
+        }
+
+        .notif-dropdown-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+
+        .notif-clear {
+            font-size: 9px;
+            color: var(--text-muted);
+            cursor: pointer;
+            letter-spacing: 0;
+            text-transform: none;
+            font-weight: 400;
+        }
+
+        .notif-clear:hover {
+            color: var(--text-secondary);
+        }
+
+        .notif-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border-subtle);
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .notif-item:hover {
+            background: var(--bg-elevated);
+        }
+
+        .notif-item:last-child {
+            border-bottom: none;
+        }
+
+        .notif-item-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+
+        .notif-item-name {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .notif-item-time {
+            font-size: 9px;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            margin-left: auto;
+        }
+
+        .notif-item-escalation {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+            font-family: var(--font-mono);
+        }
+
+        .notif-status {
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .notif-status.stable {
+            background: var(--green-dim);
+            color: var(--green-active);
+        }
+
+        .notif-status.elevated {
+            background: var(--amber-dim);
+            color: var(--amber-active);
+        }
+
+        .notif-status.critical {
+            background: var(--red-dim);
+            color: var(--red-active);
+        }
+
+        .notif-arrow {
+            color: var(--red-active);
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .notif-empty {
+            padding: 24px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
+        .header-stat .dot.red {
+            background: var(--red-active);
+            box-shadow: 0 0 6px var(--red-glow);
+        }
+
+        .header-stat .dot.amber {
+            background: var(--amber-active);
+            box-shadow: 0 0 6px var(--amber-glow);
+        }
+
+        .header-stat .dot.green {
+            background: var(--green-active);
+            box-shadow: 0 0 6px var(--green-glow);
+        }
+
+        .header-stat .count {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .data-source {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 9px;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+        }
+
+        .data-source .source-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--green-active);
+            animation: pulse-green 2s ease-in-out infinite;
+        }
+
+        .data-source.offline .source-dot {
+            background: var(--amber-active);
+            animation: none;
+        }
+
+        .clock {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            color: var(--text-muted);
+            letter-spacing: 1px;
+        }
+
+        /* ── Main Layout ────────────────────────────────────── */
+        .main {
+            position: relative;
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+            z-index: 1;
+        }
+
+        /* ── Map Container ──────────────────────────────────── */
+        .map-container {
+            flex: 1;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .map-container svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .grid-line {
+            stroke: var(--border-subtle);
+            stroke-width: 0.3;
+            opacity: 0.5;
+        }
+
+        .continent-path {
+            fill: var(--bg-card);
+            stroke: var(--border-muted);
+            stroke-width: 0.5;
+            transition: fill 0.3s ease;
+        }
+
+        /* ── Activity Dots ──────────────────────────────────── */
+        .activity-dot {
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        .activity-dot:hover .dot-inner {
+            r: 5;
+        }
+
+        .hit-area {
+            fill: transparent;
+            stroke: none;
+            cursor: pointer;
+        }
+
+        .dot-outer {
+            opacity: 0.2;
+        }
+
+        .dot-inner {
+            transition: r 0.15s ease;
+        }
+
+        .dot-critical .dot-outer {
+            animation: pulse-ring-red 2.5s ease-out infinite;
+        }
+
+        .dot-elevated .dot-outer {
+            animation: pulse-ring-amber 3s ease-out infinite;
+        }
+
+        .connection-line {
+            stroke-width: 0.5;
+            opacity: 0.12;
+            stroke-dasharray: 4, 4;
+            animation: dash-flow 20s linear infinite;
+        }
+
+        /* ── Tooltip ────────────────────────────────────────── */
+        .tooltip {
+            position: fixed;
+            z-index: 100;
+            padding: 8px 14px;
+            background: rgba(22, 22, 22, 0.92);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border-muted);
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-primary);
+            pointer-events: none;
+            opacity: 0;
+            transform: translateY(4px);
+            transition: opacity 0.15s ease, transform 0.15s ease;
+            white-space: nowrap;
+        }
+
+        .tooltip.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .tooltip-status {
+            display: inline-block;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        .tooltip-score {
+            margin-left: 6px;
+            font-family: var(--font-mono);
+            font-size: 9px;
+            color: var(--text-muted);
+        }
+
+        /* ── Side Panel ─────────────────────────────────────── */
+        .panel-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 50;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        .panel-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        .side-panel {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 380px;
+            height: 100%;
+            z-index: 60;
+            background: rgba(14, 14, 14, 0.92);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border-left: 1px solid var(--border-subtle);
+            transform: translateX(100%);
+            transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .side-panel.open {
+            transform: translateX(0);
+        }
+
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 18px 22px;
+            border-bottom: 1px solid var(--border-subtle);
+            flex-shrink: 0;
+        }
+
+        .panel-header-title {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 2.5px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .panel-close {
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-muted);
+            border-radius: 4px;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.15s ease;
+        }
+
+        .panel-close:hover {
+            border-color: var(--text-muted);
+            color: var(--text-primary);
+        }
+
+        .panel-body {
+            flex: 1;
+            padding: 22px;
+            overflow-y: auto;
+        }
+
+        .panel-body::-webkit-scrollbar {
+            width: 3px;
+        }
+
+        .panel-body::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .panel-body::-webkit-scrollbar-thumb {
+            background: var(--border-muted);
+            border-radius: 3px;
+        }
+
+        .panel-activity-name {
+            font-size: 20px;
+            font-weight: 600;
+            line-height: 1.3;
+            margin-bottom: 14px;
+        }
+
+        .panel-badges {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 22px;
+        }
+
+        .panel-status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+        }
+
+        .panel-status-badge.critical {
+            background: var(--red-dim);
+            color: var(--red-active);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        .panel-status-badge.elevated {
+            background: var(--amber-dim);
+            color: var(--amber-active);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+        }
+
+        .panel-status-badge.stable {
+            background: var(--green-dim);
+            color: var(--green-active);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+        }
+
+        .panel-status-badge .badge-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .panel-score-badge {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-muted);
+            padding: 4px 10px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 4px;
+        }
+
+        .panel-section {
+            margin-bottom: 18px;
+        }
+
+        .panel-section-label {
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .panel-section-value {
+            font-size: 13px;
+            line-height: 1.65;
+            color: var(--text-secondary);
+        }
+
+        .panel-parties {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .party-tag {
+            padding: 4px 10px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .panel-meta-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+
+        .panel-articles {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .panel-article {
+            display: block;
+            padding: 10px 12px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            text-decoration: none;
+            transition: all 0.15s ease;
+        }
+
+        .panel-article:hover {
+            border-color: var(--border-muted);
+            background: var(--bg-card);
+        }
+
+        .panel-article-title {
+            font-size: 12px;
+            line-height: 1.4;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+        }
+
+        .panel-article-meta {
+            font-size: 9px;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+        }
+
+        /* ── News River (Right Side) ────────────────────────── */
+        .news-river {
+            width: 300px;
+            height: 100%;
+            border-left: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            z-index: 5;
+        }
+
+        .news-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            flex-shrink: 0;
+        }
+
+        .news-header-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .news-breaking-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--red-active);
+            box-shadow: 0 0 6px var(--red-glow);
+            animation: pulse-red 1.5s ease-in-out infinite;
+        }
+
+        .news-header-title {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .news-count {
+            font-family: var(--font-mono);
+            font-size: 9px;
+            color: var(--text-muted);
+        }
+
+        .news-feed {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+
+        .news-feed::-webkit-scrollbar {
+            width: 2px;
+        }
+
+        .news-feed::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .news-feed::-webkit-scrollbar-thumb {
+            background: var(--border-muted);
+        }
+
+        .news-item {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(34, 34, 34, 0.5);
+            cursor: pointer;
+            transition: background 0.15s ease;
+            animation: news-slide-in 0.4s ease forwards;
+            opacity: 0;
+        }
+
+        .news-item:hover {
+            background: rgba(26, 26, 26, 0.6);
+        }
+
+        .news-item.breaking {
+            border-left: 2px solid var(--red-active);
+        }
+
+        .news-item-meta {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 5px;
+        }
+
+        .news-item-source {
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .news-item-time {
+            font-size: 9px;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            opacity: 0.7;
+        }
+
+        .news-item-dot {
+            font-size: 5px;
+            color: var(--text-muted);
+            opacity: 0.4;
+        }
+
+        .news-item-title {
+            font-size: 12px;
+            line-height: 1.45;
+            color: var(--text-secondary);
+            font-weight: 400;
+        }
+
+        .news-item-regions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 6px;
+        }
+
+        .news-region-tag {
+            font-size: 8px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-muted);
+        }
+
+        .news-empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            font-size: 11px;
+            text-align: center;
+            padding: 20px;
+        }
+
+        /* ── Activity List (bottom-left strip) ──────────────── */
+        .activity-strip {
+            position: absolute;
+            bottom: 14px;
+            left: 24px;
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            max-height: 200px;
+            overflow-y: auto;
+            padding-right: 8px;
+        }
+
+        .activity-strip::-webkit-scrollbar {
+            width: 2px;
+        }
+
+        .activity-strip::-webkit-scrollbar-thumb {
+            background: var(--border-muted);
+        }
+
+        .strip-item {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 4px 10px;
+            background: rgba(14, 14, 14, 0.75);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            font-size: 10px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .strip-item:hover {
+            border-color: var(--border-muted);
+            color: var(--text-secondary);
+            background: rgba(22, 22, 22, 0.88);
+        }
+
+        .strip-item .strip-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .strip-item .strip-dot.red {
+            background: var(--red-active);
+            box-shadow: 0 0 4px var(--red-glow);
+        }
+
+        .strip-item .strip-dot.amber {
+            background: var(--amber-active);
+            box-shadow: 0 0 4px var(--amber-glow);
+        }
+
+        .strip-item .strip-dot.green {
+            background: var(--green-active);
+            box-shadow: 0 0 4px var(--green-glow);
+        }
+
+        .strip-item .strip-type {
+            font-family: var(--font-mono);
+            font-size: 9px;
+            color: var(--text-muted);
+            opacity: 0.6;
+        }
+
+        .strip-item .strip-score {
+            font-family: var(--font-mono);
+            font-size: 9px;
+            margin-left: auto;
+            opacity: 0.5;
+        }
+
+        /* ── Legend Bar ──────────────────────────────────────── */
+        .legend-bar {
+            position: relative;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 24px;
+            border-top: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+            flex-shrink: 0;
+        }
+
+        .legend-items {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 9px;
+            font-weight: 500;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .legend-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .legend-dot.red {
+            background: var(--red-active);
+            box-shadow: 0 0 5px var(--red-glow);
+        }
+
+        .legend-dot.amber {
+            background: var(--amber-active);
+            box-shadow: 0 0 5px var(--amber-glow);
+        }
+
+        .legend-dot.green {
+            background: var(--green-active);
+            box-shadow: 0 0 5px var(--green-glow);
+        }
+
+        .legend-attribution {
+            font-size: 9px;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+        }
+
+        /* ── Animations ─────────────────────────────────────── */
+        @keyframes pulse-green {
+
+            0%,
+            100% {
+                box-shadow: 0 0 6px var(--green-glow);
+            }
+
+            50% {
+                box-shadow: 0 0 14px var(--green-glow), 0 0 20px rgba(34, 197, 94, 0.15);
+            }
+        }
+
+        @keyframes pulse-red {
+
+            0%,
+            100% {
+                box-shadow: 0 0 4px var(--red-glow);
+                opacity: 1;
+            }
+
+            50% {
+                box-shadow: 0 0 10px var(--red-glow);
+                opacity: 0.6;
+            }
+        }
+
+        @keyframes pulse-ring-red {
+            0% {
+                r: 6;
+                opacity: 0.3;
+            }
+
+            100% {
+                r: 18;
+                opacity: 0;
+            }
+        }
+
+        @keyframes pulse-ring-amber {
+            0% {
+                r: 5;
+                opacity: 0.2;
+            }
+
+            100% {
+                r: 14;
+                opacity: 0;
+            }
+        }
+
+        @keyframes dash-flow {
+            to {
+                stroke-dashoffset: -100;
+            }
+        }
+
+        @keyframes news-slide-in {
+            from {
+                opacity: 0;
+                transform: translateX(8px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        /* ── Responsive ─────────────────────────────────────── */
+        @media (max-width: 900px) {
+            .news-river {
+                display: none;
+            }
+
+            .side-panel {
+                width: 100%;
+            }
+
+            .activity-strip {
+                display: none;
+            }
+        }
+
+        @media (max-width: 600px) {
+            .header-stat {
+                display: none;
+            }
+
+            .data-source {
+                display: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="header-logo"></div>
+            <span class="header-title">Global Activity Monitor</span>
+        </div>
+        <div class="header-right">
+            <div class="header-stat">
+                <span class="dot red"></span>
+                <span class="count" id="criticalCount">0</span>
+                <span>critical</span>
+            </div>
+            <div class="header-stat">
+                <span class="dot amber"></span>
+                <span class="count" id="elevatedCount">0</span>
+                <span>elevated</span>
+            </div>
+            <div class="header-stat">
+                <span class="dot green"></span>
+                <span class="count" id="stableCount">0</span>
+                <span>stable</span>
+            </div>
+            <div class="data-source" id="dataSource">
+                <span class="source-dot"></span>
+                <span id="sourceLabel">CONNECTING</span>
+            </div>
+            <div class="notif-bell" id="notifBell">
+                <svg viewBox="0 0 24 24">
+                    <path
+                        d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z" />
+                </svg>
+                <span class="notif-badge" id="notifBadge">0</span>
+                <div class="notif-dropdown" id="notifDropdown">
+                    <div class="notif-dropdown-header">
+                        <span>⚠ Escalations</span>
+                        <span class="notif-clear" id="notifClear">Clear all</span>
+                    </div>
+                    <div id="notifList">
+                        <div class="notif-empty">No escalations yet</div>
+                    </div>
+                </div>
+            </div>
+            <div class="clock" id="clock">00:00:00 UTC</div>
+        </div>
+    </header>
+
+    <!-- Main -->
+    <main class="main">
+        <!-- Map -->
+        <div class="map-container" id="mapContainer">
+            <svg id="mapSvg" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet"
+                xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                    <filter id="glow-red" x="-50%" y="-50%" width="200%" height="200%">
+                        <feGaussianBlur stdDeviation="3" result="blur" />
+                        <feMerge>
+                            <feMergeNode in="blur" />
+                            <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                    </filter>
+                    <filter id="glow-green" x="-50%" y="-50%" width="200%" height="200%">
+                        <feGaussianBlur stdDeviation="2" result="blur" />
+                        <feMerge>
+                            <feMergeNode in="blur" />
+                            <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                    </filter>
+                    <filter id="glow-amber" x="-50%" y="-50%" width="200%" height="200%">
+                        <feGaussianBlur stdDeviation="2.5" result="blur" />
+                        <feMerge>
+                            <feMergeNode in="blur" />
+                            <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                    </filter>
+                </defs>
+                <g id="grid"></g>
+                <g id="continents"></g>
+                <g id="connections"></g>
+                <g id="dots"></g>
+            </svg>
+        </div>
+
+        <!-- Activity strip -->
+        <div class="activity-strip" id="activityStrip"></div>
+
+        <!-- Panel overlay -->
+        <div class="panel-overlay" id="panelOverlay"></div>
+
+        <!-- Side panel -->
+        <div class="side-panel" id="sidePanel">
+            <div class="panel-header">
+                <span class="panel-header-title">Activity Detail</span>
+                <button class="panel-close" id="panelClose">✕</button>
+            </div>
+            <div class="panel-body" id="panelBody"></div>
+        </div>
+
+        <!-- News River -->
+        <aside class="news-river" id="newsRiver">
+            <div class="news-header">
+                <div class="news-header-left">
+                    <div class="news-breaking-dot"></div>
+                    <span class="news-header-title">Breaking</span>
+                </div>
+                <span class="news-count" id="newsCount">0 items</span>
+            </div>
+            <div class="news-feed" id="newsFeed">
+                <div class="news-empty">
+                    <span>Connecting to news feeds…</span>
+                </div>
+            </div>
+        </aside>
+    </main>
+
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip"></div>
+
+    <!-- Legend -->
+    <footer class="legend-bar">
+        <div class="legend-items">
+            <div class="legend-item">
+                <span class="legend-dot red"></span>
+                <span>Critical</span>
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot amber"></span>
+                <span>Elevated</span>
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot green"></span>
+                <span>Monitoring</span>
+            </div>
+        </div>
+        <span class="legend-attribution">Auto-Discovery · GDELT GEO + RSS</span>
+    </footer>
+
+    <script>
+        // ═══════════════════════════════════════════════════════
+        // CONFIG
+        // ═══════════════════════════════════════════════════════
+        const API_BASE = window.location.origin;
+        const WS_URL = `ws://${window.location.host}/ws`;
+        const REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+        // ═══════════════════════════════════════════════════════
+        // STATE
+        // ═══════════════════════════════════════════════════════
+        let activities = [];
+        let newsItems = [];
+        let ws = null;
+        let wsConnected = false;
+
+        // ═══════════════════════════════════════════════════════
+        // SIMPLIFIED WORLD MAP PATHS
+        // ═══════════════════════════════════════════════════════
+        const continentPaths = [
+            "M 120 85 L 135 80 L 155 82 L 175 78 L 195 80 L 218 75 L 235 82 L 248 90 L 262 88 L 275 95 L 280 110 L 270 118 L 258 125 L 252 135 L 245 148 L 238 158 L 232 165 L 225 172 L 218 178 L 210 182 L 200 185 L 192 190 L 185 198 L 178 210 L 172 218 L 168 225 L 160 228 L 152 222 L 148 215 L 145 208 L 140 200 L 132 195 L 125 190 L 118 185 L 115 178 L 108 172 L 102 168 L 96 165 L 92 158 L 88 148 L 92 140 L 98 132 L 105 125 L 110 115 L 115 105 L 118 95 Z",
+            "M 210 250 L 218 245 L 228 248 L 238 255 L 245 262 L 250 272 L 255 285 L 258 298 L 260 310 L 262 325 L 260 340 L 255 355 L 248 368 L 240 378 L 232 388 L 225 395 L 218 400 L 212 405 L 208 398 L 205 388 L 202 375 L 198 360 L 195 345 L 192 330 L 190 315 L 188 300 L 190 285 L 195 272 L 200 260 L 205 252 Z",
+            "M 468 85 L 478 82 L 490 84 L 502 80 L 515 82 L 525 86 L 535 90 L 542 95 L 545 102 L 540 110 L 535 118 L 528 125 L 520 130 L 512 135 L 505 140 L 498 145 L 490 148 L 482 150 L 475 148 L 468 145 L 460 140 L 455 135 L 452 128 L 448 120 L 450 112 L 454 105 L 458 98 L 462 92 Z",
+            "M 460 175 L 475 170 L 490 172 L 505 175 L 518 180 L 528 188 L 535 198 L 540 210 L 542 225 L 540 240 L 535 255 L 528 270 L 522 285 L 518 298 L 515 310 L 510 325 L 505 335 L 498 345 L 490 350 L 482 348 L 475 342 L 468 335 L 462 325 L 458 312 L 455 298 L 452 285 L 450 270 L 448 255 L 450 240 L 452 225 L 455 210 L 458 198 L 460 188 Z",
+            "M 545 75 L 565 70 L 590 68 L 620 72 L 650 75 L 680 78 L 710 80 L 735 82 L 760 85 L 780 90 L 792 98 L 800 108 L 798 120 L 790 130 L 780 138 L 768 145 L 755 150 L 740 155 L 722 158 L 705 162 L 688 165 L 670 168 L 652 172 L 638 178 L 625 185 L 612 190 L 600 195 L 588 198 L 575 200 L 565 195 L 555 188 L 548 178 L 542 168 L 538 158 L 535 148 L 532 138 L 530 125 L 532 112 L 535 100 L 538 90 L 542 82 Z",
+            "M 760 290 L 778 285 L 798 288 L 818 292 L 835 300 L 845 312 L 848 325 L 842 338 L 832 348 L 818 355 L 802 358 L 785 355 L 770 348 L 758 338 L 752 325 L 750 312 L 752 300 Z",
+            "M 700 240 L 710 238 L 722 240 L 735 242 L 748 244 L 755 248 L 750 252 L 742 255 L 730 256 L 718 255 L 708 252 L 702 248 Z",
+            "M 310 50 L 325 45 L 340 48 L 352 52 L 358 60 L 355 70 L 348 78 L 338 82 L 325 80 L 315 75 L 308 68 L 305 60 Z",
+            "M 805 125 L 810 118 L 815 125 L 818 135 L 815 145 L 810 150 L 805 145 L 802 135 Z",
+            "M 458 90 L 462 85 L 468 88 L 465 95 L 460 98 Z",
+            "M 540 315 L 545 308 L 550 315 L 548 325 L 542 330 L 538 325 Z"
+        ];
+
+        // ═══════════════════════════════════════════════════════
+        // COORDINATE PROJECTION
+        // ═══════════════════════════════════════════════════════
+        function latLngToXY(lat, lng) {
+            const x = ((lng + 180) / 360) * 1000;
+            const y = ((90 - lat) / 180) * 500;
+            return { x, y };
+        }
+
+        function haversineKm(lat1, lng1, lat2, lng2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLng = (lng2 - lng1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) ** 2 +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLng / 2) ** 2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // DOM REFS
+        // ═══════════════════════════════════════════════════════
+        const svg = document.getElementById('mapSvg');
+        const gridG = document.getElementById('grid');
+        const continentsG = document.getElementById('continents');
+        const connectionsG = document.getElementById('connections');
+        const dotsG = document.getElementById('dots');
+        const tooltip = document.getElementById('tooltip');
+        const sidePanel = document.getElementById('sidePanel');
+        const panelOverlay = document.getElementById('panelOverlay');
+        const panelBody = document.getElementById('panelBody');
+        const panelClose = document.getElementById('panelClose');
+        const activityStrip = document.getElementById('activityStrip');
+        const newsFeed = document.getElementById('newsFeed');
+
+        // ═══════════════════════════════════════════════════════
+        // STATUS COLORS
+        // ═══════════════════════════════════════════════════════
+        const STATUS_COLORS = {
+            critical: { css: 'var(--red-active)', glow: 'url(#glow-red)', dot: 'red' },
+            elevated: { css: 'var(--amber-active)', glow: 'url(#glow-amber)', dot: 'amber' },
+            stable: { css: 'var(--green-active)', glow: 'url(#glow-green)', dot: 'green' }
+        };
+
+        // ═══════════════════════════════════════════════════════
+        // DRAW STATIC MAP
+        // ═══════════════════════════════════════════════════════
+        function drawGrid() {
+            for (let lng = -180; lng <= 180; lng += 30) {
+                const x = ((lng + 180) / 360) * 1000;
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', x); line.setAttribute('y1', 0);
+                line.setAttribute('x2', x); line.setAttribute('y2', 500);
+                line.setAttribute('class', 'grid-line');
+                gridG.appendChild(line);
+            }
+            for (let lat = -90; lat <= 90; lat += 30) {
+                const y = ((90 - lat) / 180) * 500;
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', 0); line.setAttribute('y1', y);
+                line.setAttribute('x2', 1000); line.setAttribute('y2', y);
+                line.setAttribute('class', 'grid-line');
+                gridG.appendChild(line);
+            }
+        }
+
+        function drawContinents() {
+            continentPaths.forEach(d => {
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('d', d);
+                path.setAttribute('class', 'continent-path');
+                continentsG.appendChild(path);
+            });
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // DRAW ACTIVITIES (called on each data update)
+        // ═══════════════════════════════════════════════════════
+        function renderActivities(acts) {
+            // Clear existing
+            dotsG.innerHTML = '';
+            connectionsG.innerHTML = '';
+            activityStrip.innerHTML = '';
+
+            // Dynamic connection lines: connect nearby situations (<2000km)
+            for (let i = 0; i < acts.length; i++) {
+                for (let j = i + 1; j < acts.length; j++) {
+                    const a = acts[i], b = acts[j];
+                    const dist = haversineKm(a.lat, a.lng, b.lat, b.lng);
+                    if (dist < 2000 && (a.status !== 'stable' || b.status !== 'stable')) {
+                        const posA = latLngToXY(a.lat, a.lng);
+                        const posB = latLngToXY(b.lat, b.lng);
+                        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                        line.setAttribute('x1', posA.x); line.setAttribute('y1', posA.y);
+                        line.setAttribute('x2', posB.x); line.setAttribute('y2', posB.y);
+                        line.setAttribute('class', 'connection-line');
+                        line.setAttribute('stroke', STATUS_COLORS[a.status]?.css || 'var(--red-active)');
+                        connectionsG.appendChild(line);
+                    }
+                }
+            }
+
+            // Dots
+            acts.forEach((act, idx) => {
+                const { x, y } = latLngToXY(act.lat, act.lng);
+                const sc = STATUS_COLORS[act.status] || STATUS_COLORS.stable;
+                const isCritical = act.status === 'critical';
+                const isElevated = act.status === 'elevated';
+
+                const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                g.setAttribute('class', `activity-dot dot-${act.status}`);
+                g.setAttribute('data-id', act.id);
+                g.style.color = sc.css;
+
+                // Outer pulse ring (critical/elevated)
+                if (isCritical || isElevated) {
+                    const outer = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                    outer.setAttribute('cx', x); outer.setAttribute('cy', y);
+                    outer.setAttribute('r', isCritical ? '6' : '5');
+                    outer.setAttribute('fill', 'none');
+                    outer.setAttribute('stroke', sc.css);
+                    outer.setAttribute('stroke-width', '1');
+                    outer.setAttribute('class', 'dot-outer');
+                    outer.style.animationDelay = `${idx * 0.3}s`;
+                    g.appendChild(outer);
+                }
+
+                // Inner dot
+                const inner = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                inner.setAttribute('cx', x); inner.setAttribute('cy', y);
+                inner.setAttribute('r', isCritical ? '4' : isElevated ? '3' : '2.5');
+                inner.setAttribute('fill', sc.css);
+                inner.setAttribute('class', 'dot-inner');
+                inner.setAttribute('filter', sc.glow);
+                g.appendChild(inner);
+
+                // Hit area
+                const hitArea = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                hitArea.setAttribute('cx', x); hitArea.setAttribute('cy', y);
+                hitArea.setAttribute('r', '12');
+                hitArea.setAttribute('class', 'hit-area');
+                g.appendChild(hitArea);
+
+                // Events
+                g.addEventListener('mouseenter', (e) => showTooltip(e, act));
+                g.addEventListener('mousemove', (e) => moveTooltip(e));
+                g.addEventListener('mouseleave', hideTooltip);
+                g.addEventListener('click', (e) => { e.stopPropagation(); openPanel(act); });
+
+                dotsG.appendChild(g);
+            });
+
+            // Strip
+            acts.forEach(act => {
+                const sc = STATUS_COLORS[act.status] || STATUS_COLORS.stable;
+                const el = document.createElement('div');
+                el.className = 'strip-item';
+                el.innerHTML = `
+                <span class="strip-dot ${sc.dot}"></span>
+                <span>${act.name}</span>
+                <span class="strip-type">${act.type}</span>
+                <span class="strip-score">${act.score}</span>
+            `;
+                el.addEventListener('click', () => openPanel(act));
+                activityStrip.appendChild(el);
+            });
+
+            // Header counts
+            const critical = acts.filter(a => a.status === 'critical').length;
+            const elevated = acts.filter(a => a.status === 'elevated').length;
+            const stable = acts.filter(a => a.status === 'stable').length;
+            document.getElementById('criticalCount').textContent = critical;
+            document.getElementById('elevatedCount').textContent = elevated;
+            document.getElementById('stableCount').textContent = stable;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // RENDER NEWS FEED
+        // ═══════════════════════════════════════════════════════
+        function renderNews(items, append = false) {
+            if (!append) {
+                newsFeed.innerHTML = '';
+            }
+
+            if (items.length === 0 && !append) {
+                newsFeed.innerHTML = '<div class="news-empty"><span>No breaking news at this time</span></div>';
+                return;
+            }
+
+            const fragment = document.createDocumentFragment();
+            items.forEach((item, idx) => {
+                const el = document.createElement('div');
+                el.className = `news-item ${item.isBreaking ? 'breaking' : ''}`;
+                el.style.animationDelay = `${idx * 0.05}s`;
+
+                let regionTags = '';
+                if (item.regions && item.regions.length > 0) {
+                    regionTags = `<div class="news-item-regions">
+                    ${item.regions.map(r => {
+                        const act = activities.find(a => a.id === r);
+                        return `<span class="news-region-tag">${act ? act.name : r}</span>`;
+                    }).join('')}
+                </div>`;
+                }
+
+                el.innerHTML = `
+                <div class="news-item-meta">
+                    <span class="news-item-source">${item.source}</span>
+                    <span class="news-item-dot">●</span>
+                    <span class="news-item-time">${item.timeAgo || ''}</span>
+                </div>
+                <div class="news-item-title">${item.title}</div>
+                ${regionTags}
+            `;
+
+                // Click to open article link
+                el.addEventListener('click', () => {
+                    if (item.link) window.open(item.link, '_blank');
+                });
+
+                fragment.appendChild(el);
+            });
+
+            if (append) {
+                newsFeed.insertBefore(fragment, newsFeed.firstChild);
+            } else {
+                newsFeed.appendChild(fragment);
+            }
+
+            document.getElementById('newsCount').textContent = `${newsFeed.querySelectorAll('.news-item').length} items`;
+        }
+
+        function highlightDot(actId) {
+            // Brief flash effect on the relevant dot
+            const dotG = document.querySelector(`.activity-dot[data-id="${actId}"]`);
+            if (!dotG) return;
+            const inner = dotG.querySelector('.dot-inner');
+            if (!inner) return;
+            const origR = inner.getAttribute('r');
+            inner.setAttribute('r', '8');
+            setTimeout(() => inner.setAttribute('r', origR), 600);
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // TOOLTIP
+        // ═══════════════════════════════════════════════════════
+        function showTooltip(e, act) {
+            const sc = STATUS_COLORS[act.status] || STATUS_COLORS.stable;
+            tooltip.innerHTML = `<span class="tooltip-status" style="background:${sc.css}"></span>${act.name} · ${act.type}<span class="tooltip-score">${act.score}/10</span>`;
+            tooltip.classList.add('visible');
+            moveTooltip(e);
+        }
+
+        function moveTooltip(e) {
+            tooltip.style.left = (e.clientX + 14) + 'px';
+            tooltip.style.top = (e.clientY - 10) + 'px';
+        }
+
+        function hideTooltip() {
+            tooltip.classList.remove('visible');
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // SIDE PANEL
+        // ═══════════════════════════════════════════════════════
+        function openPanel(act) {
+            const sc = STATUS_COLORS[act.status] || STATUS_COLORS.stable;
+
+            let articlesHtml = '';
+            if (act.topArticles && act.topArticles.length > 0) {
+                articlesHtml = `
+                <div class="panel-section">
+                    <div class="panel-section-label">Related Coverage</div>
+                    <div class="panel-articles">
+                        ${act.topArticles.map(a => `
+                            <a class="panel-article" href="${a.url}" target="_blank" rel="noopener">
+                                <div class="panel-article-title">${a.title}</div>
+                                <div class="panel-article-meta">${a.source} · tone: ${a.tone?.toFixed(1) || 'n/a'}</div>
+                            </a>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+            }
+
+            panelBody.innerHTML = `
+            <h2 class="panel-activity-name">${act.name}</h2>
+            <div class="panel-badges">
+                <div class="panel-status-badge ${act.status}">
+                    <span class="badge-dot"></span>
+                    ${act.status.charAt(0).toUpperCase() + act.status.slice(1)}
+                </div>
+                <span class="panel-score-badge">${act.score} / 10</span>
+            </div>
+
+            <div class="panel-meta-grid">
+                <div class="panel-section">
+                    <div class="panel-section-label">Type</div>
+                    <div class="panel-section-value">${act.type}</div>
+                </div>
+                <div class="panel-section">
+                    <div class="panel-section-label">Region</div>
+                    <div class="panel-section-value">${act.region}</div>
+                </div>
+            </div>
+
+            <div class="panel-meta-grid">
+                <div class="panel-section">
+                    <div class="panel-section-label">Coordinates</div>
+                    <div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px;">
+                        ${act.lat.toFixed(1)}°${act.lat >= 0 ? 'N' : 'S'}, ${Math.abs(act.lng).toFixed(1)}°${act.lng >= 0 ? 'E' : 'W'}
+                    </div>
+                </div>
+                <div class="panel-section">
+                    <div class="panel-section-label">Articles (24h)</div>
+                    <div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px;">
+                        ${act.articleCount || 0} articles
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <div class="panel-section-label">Situation</div>
+                <div class="panel-section-value">${act.description}</div>
+            </div>
+
+            <div class="panel-section">
+                <div class="panel-section-label">Parties Involved</div>
+                <div class="panel-parties">
+                    ${act.parties.map(p => `<span class="party-tag">${p}</span>`).join('')}
+                </div>
+            </div>
+
+            ${articlesHtml}
+        `;
+
+            sidePanel.classList.add('open');
+            panelOverlay.classList.add('active');
+        }
+
+        function closePanel() {
+            sidePanel.classList.remove('open');
+            panelOverlay.classList.remove('active');
+        }
+
+        panelClose.addEventListener('click', closePanel);
+        panelOverlay.addEventListener('click', closePanel);
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePanel(); });
+
+        // ═══════════════════════════════════════════════════════
+        // UTC CLOCK
+        // ═══════════════════════════════════════════════════════
+        function updateClock() {
+            const now = new Date();
+            const h = String(now.getUTCHours()).padStart(2, '0');
+            const m = String(now.getUTCMinutes()).padStart(2, '0');
+            const s = String(now.getUTCSeconds()).padStart(2, '0');
+            document.getElementById('clock').textContent = `${h}:${m}:${s} UTC`;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // ═══════════════════════════════════════════════════════
+        // API FETCHING
+        // ═══════════════════════════════════════════════════════
+        async function fetchActivities() {
+            try {
+                const res = await fetch(`${API_BASE}/api/activities`);
+                const data = await res.json();
+                activities = data.activities || [];
+                renderActivities(activities);
+                updateDataSource(data.source === 'live' ? 'LIVE' : 'BASELINE');
+            } catch (err) {
+                console.error('[fetch] Activities error:', err);
+                updateDataSource('OFFLINE');
+            }
+        }
+
+        async function fetchNews() {
+            try {
+                const res = await fetch(`${API_BASE}/api/news`);
+                const data = await res.json();
+                newsItems = data.news || [];
+                renderNews(newsItems);
+            } catch (err) {
+                console.error('[fetch] News error:', err);
+            }
+        }
+
+        function updateDataSource(label) {
+            const el = document.getElementById('dataSource');
+            const labelEl = document.getElementById('sourceLabel');
+            labelEl.textContent = label;
+            if (label === 'LIVE') {
+                el.classList.remove('offline');
+            } else {
+                el.classList.add('offline');
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // WEBSOCKET
+        // ═══════════════════════════════════════════════════════
+        function connectWebSocket() {
+            try {
+                ws = new WebSocket(WS_URL);
+
+                ws.onopen = () => {
+                    wsConnected = true;
+                    console.log('[ws] Connected');
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+
+                        if (msg.type === 'init') {
+                            activities = msg.activities || [];
+                            renderActivities(activities);
+                            if (msg.news && msg.news.length > 0) {
+                                newsItems = msg.news;
+                                renderNews(newsItems);
+                            }
+                            updateDataSource('LIVE');
+                        }
+
+                        if (msg.type === 'activities_update') {
+                            activities = msg.activities || [];
+                            renderActivities(activities);
+                            updateDataSource('LIVE');
+                        }
+
+                        if (msg.type === 'news_update') {
+                            const newItems = msg.items || [];
+                            if (newItems.length > 0) {
+                                newsItems = [...newItems, ...newsItems].slice(0, 50);
+                                renderNews(newItems, true);
+                            }
+                        }
+
+                        if (msg.type === 'escalation') {
+                            const escs = msg.escalations || [];
+                            escs.forEach(esc => handleEscalation(esc));
+                        }
+                    } catch (err) {
+                        console.error('[ws] Parse error:', err);
+                    }
+                };
+
+                ws.onclose = () => {
+                    wsConnected = false;
+                    console.log('[ws] Disconnected, retrying in 5s...');
+                    updateDataSource('RECONNECTING');
+                    setTimeout(connectWebSocket, 5000);
+                };
+
+                ws.onerror = (err) => {
+                    console.error('[ws] Error');
+                    ws.close();
+                };
+            } catch (err) {
+                console.error('[ws] Connection failed:', err);
+                setTimeout(connectWebSocket, 5000);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // BOOT
+        // ═══════════════════════════════════════════════════════
+        drawGrid();
+        drawContinents();
+
+        // Fetch initial data via REST
+        fetchActivities();
+        fetchNews();
+
+        // Connect WebSocket for live updates
+        connectWebSocket();
+
+        // Periodic REST fallback refresh
+        setInterval(fetchActivities, REFRESH_INTERVAL);
+        setInterval(fetchNews, 5 * 60 * 1000);
+
+        // ═══════════════════════════════════════════════════════
+        // NOTIFICATION SYSTEM
+        // ═══════════════════════════════════════════════════════
+        const notifBell = document.getElementById('notifBell');
+        const notifBadge = document.getElementById('notifBadge');
+        const notifDropdown = document.getElementById('notifDropdown');
+        const notifList = document.getElementById('notifList');
+        const notifClear = document.getElementById('notifClear');
+        let escalationHistory = [];
+        let unreadCount = 0;
+
+        // Bell click — toggle dropdown
+        notifBell.addEventListener('click', (e) => {
+            e.stopPropagation();
+            notifDropdown.classList.toggle('open');
+            if (notifDropdown.classList.contains('open')) {
+                unreadCount = 0;
+                notifBadge.classList.remove('visible');
+                notifBell.classList.remove('has-alerts');
+            }
+        });
+
+        // Close dropdown on outside click
+        document.addEventListener('click', (e) => {
+            if (!notifBell.contains(e.target)) {
+                notifDropdown.classList.remove('open');
+            }
+        });
+
+        // Clear all
+        notifClear.addEventListener('click', (e) => {
+            e.stopPropagation();
+            escalationHistory = [];
+            unreadCount = 0;
+            notifBadge.classList.remove('visible');
+            notifList.innerHTML = '<div class="notif-empty">No escalations yet</div>';
+        });
+
+        // Alert sound using Web Audio API
+        let audioCtx = null;
+        function playAlertSound() {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const now = audioCtx.currentTime;
+
+                // Two-tone ascending alert
+                [0, 0.15].forEach((delay, i) => {
+                    const osc = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    osc.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    osc.type = 'sine';
+                    osc.frequency.value = i === 0 ? 440 : 660; // A4 → E5
+                    gain.gain.setValueAtTime(0.15, now + delay);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.25);
+                    osc.start(now + delay);
+                    osc.stop(now + delay + 0.3);
+                });
+            } catch (e) {
+                console.warn('[audio] Sound not available:', e.message);
+            }
+        }
+
+        // Handle an escalation event
+        function handleEscalation(esc) {
+            // Add to history
+            escalationHistory.unshift(esc);
+            if (escalationHistory.length > 20) escalationHistory.pop();
+
+            // Update badge
+            unreadCount++;
+            notifBadge.textContent = unreadCount;
+            notifBadge.classList.add('visible');
+
+            // Ring the bell
+            notifBell.classList.remove('has-alerts');
+            void notifBell.offsetWidth; // force reflow
+            notifBell.classList.add('has-alerts');
+
+            // Play sound
+            playAlertSound();
+
+            // Render dropdown
+            renderEscalations();
+
+            // Flash the dot on the map
+            flashDot(esc.name);
+
+            // Browser notification
+            if (Notification.permission === 'granted') {
+                new Notification(`⚠ ESCALATION: ${esc.name}`, {
+                    body: `${esc.from.toUpperCase()} → ${esc.to.toUpperCase()} (Score: ${esc.score})`,
+                    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="80" font-size="80">🔴</text></svg>',
+                    tag: `escalation-${esc.name}`,
+                });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission();
+            }
+
+            console.log(`[ESCALATION] ${esc.name}: ${esc.from} → ${esc.to}`);
+        }
+
+        function renderEscalations() {
+            if (escalationHistory.length === 0) {
+                notifList.innerHTML = '<div class="notif-empty">No escalations yet</div>';
+                return;
+            }
+
+            notifList.innerHTML = escalationHistory.map(esc => {
+                const timeStr = new Date(esc.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                return `
+                    <div class="notif-item">
+                        <div class="notif-item-header">
+                            <span class="notif-item-name">${esc.name}</span>
+                            <span class="notif-item-time">${timeStr}</span>
+                        </div>
+                        <div class="notif-item-escalation">
+                            <span class="notif-status ${esc.from}">${esc.from}</span>
+                            <span class="notif-arrow">→</span>
+                            <span class="notif-status ${esc.to}">${esc.to}</span>
+                            <span style="margin-left:auto;font-size:9px;color:var(--text-muted);">Score: ${esc.score}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function flashDot(name) {
+            // Find the dot for this situation by matching name in the strip
+            const act = activities.find(a => a.name === name);
+            if (!act) return;
+            const dotG = document.querySelector(`.activity-dot[data-id="${act.id}"]`);
+            if (!dotG) return;
+            const inner = dotG.querySelector('.dot-inner');
+            if (!inner) return;
+            const origR = inner.getAttribute('r');
+            // Flash large then back
+            inner.setAttribute('r', '12');
+            inner.style.transition = 'r 0.3s';
+            setTimeout(() => {
+                inner.setAttribute('r', origR);
+                setTimeout(() => {
+                    inner.setAttribute('r', '10');
+                    setTimeout(() => inner.setAttribute('r', origR), 300);
+                }, 300);
+            }, 400);
+        }
+
+        // Request notification permission on first interaction
+        document.addEventListener('click', () => {
+            if (Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
+        }, { once: true });
+    </script>
+</body>
+
+</html>
