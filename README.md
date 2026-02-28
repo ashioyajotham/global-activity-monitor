@@ -19,15 +19,19 @@ The underlying thesis is that a useful global monitor needs three properties:
 
 ## Architecture
 
-The system is a four-file Node.js application with a browser-based frontend. There is no database, no build step, no framework. State lives in memory and refreshes from live data on a cron cycle.
+The system is a six-file Node.js application with a browser-based frontend. SQLite persists situation history across restarts. No build step, no framework beyond Express.
 
 ```
 global-activity-monitor/
-  server.js        -- Express + WebSocket server, cron scheduling, pipeline orchestration
-  discovery.js     -- Situation discovery engine: gazetteer, clustering, scoring, summarisation
-  feeds.js         -- RSS ingestion, sentiment analysis, deduplication
-  index.html       -- Full frontend: SVG world map, side panel, notifications, news river
-  package.json     -- 7 dependencies, nothing else
+  server.js           -- Express + WebSocket server, cron scheduling, pipeline orchestration, auth
+  discovery.js        -- Situation discovery engine: clustering, scoring, summarisation, noise filter
+  countries-data.js   -- ISO 3166-1 standard geodata: 150+ countries with coordinates, capitals, aliases
+  feeds.js            -- RSS ingestion, geopolitical sentiment lexicon, deduplication
+  db.js               -- SQLite persistence layer: situation snapshots, articles, escalation history
+  index.html          -- Frontend: D3.js + TopoJSON world map, side panel, notifications, news river
+  package.json        -- 7 dependencies
+  .env.example        -- Environment variable reference
+  ARCHITECTURE_PLAN.md -- Hardcoding audit and improvement roadmap
 ```
 
 ### Data flow
@@ -35,50 +39,66 @@ global-activity-monitor/
 ```mermaid
 graph LR
     subgraph Data Sources
-        GDELT["GDELT GEO 2.0 API<br/>(satellite events)"]
+        GEO["GDELT GEO 2.0 API<br/>(satellite geo-events)"]
+        DOC["GDELT DOC 2.0 API<br/>(article metadata + locations)"]
         RSS["RSS Feeds<br/>(9 sources)"]
     end
 
     subgraph Ingestion
-        GF["fetchAllGeoEvents()"]
+        GF["fetchGeoTheme()"]
+        DF["fetchDocTheme()"]
         NF["fetchAllNews()"]
-        SA["Sentiment Analysis<br/>(NLP tone scoring)"]
+        SA["Geopolitical Sentiment<br/>(custom lexicon)"]
     end
 
     subgraph Discovery Engine
-        NTE["newsToEvents()<br/>(gazetteer geocoding)"]
-        CL["clusterEvents()<br/>(500km radius)"]
+        NTE["newsToEvents()<br/>(ISO gazetteer geocoding)"]
+        NR["filterNoiseEvents()<br/>(sports/entertainment removal)"]
+        CL["clusterEvents()<br/>(500km Haversine radius)"]
+        CF["assessConfidence()<br/>(high / normal / low / noise)"]
         SC["scoreSituation()<br/>(volume + severity + tone)"]
         SUM["autoDescribeSituation()<br/>(TF-IDF extractive summariser)"]
-        DD["Deduplication<br/>(alphabetical naming)"]
+    end
+
+    subgraph Persistence
+        DB["SQLite<br/>(better-sqlite3)"]
+        TR["Trend queries"]
+        ES["Escalation history"]
     end
 
     subgraph Output
         WS["WebSocket<br/>(real-time push)"]
         ESC["Escalation Detector"]
-        UI["Browser UI<br/>(SVG map + panels)"]
+        API["REST API<br/>(/api/trends, /api/stats)"]
+        UI["Browser UI<br/>(D3 + TopoJSON map)"]
     end
 
-    GDELT --> GF --> CL
-    RSS --> NF --> SA --> NTE --> CL
-    CL --> SC --> SUM --> DD --> WS --> UI
-    DD --> ESC --> WS
+    GEO --> GF --> NR
+    DOC --> DF --> NR
+    RSS --> NF --> SA --> NTE --> NR
+    NR --> CL --> CF --> SC --> SUM
+    SUM --> DB
+    SUM --> WS --> UI
+    SUM --> ESC --> WS
+    DB --> TR --> API
+    DB --> ES --> API
 ```
 
 ### Pipeline timing
 
-| Stage | Frequency | Source |
+| Stage | Frequency | Detail |
 |-------|-----------|--------|
-| GDELT GEO scan | Every 10 minutes | 5 thematic queries, 75 events each, 2s delay between queries |
-| RSS feed refresh | Every 5 minutes | 9 feeds fetched sequentially with 10s timeout per feed |
-| Discovery pipeline | Triggered after each GDELT scan | Clusters all events, scores, deduplicates, pushes via WebSocket |
-| Escalation check | Every discovery cycle | Compares current status against previous state map |
+| GDELT GEO scan | Every 10 min | 5 thematic queries, 75 events each, 2.2s delay between queries |
+| GDELT DOC scan | Every 10 min | First 3 themes, interleaved with GEO queries (rate budget) |
+| RSS feed refresh | Every 5 min | 9 feeds fetched sequentially, 10s timeout per feed |
+| Discovery pipeline | After each GDELT scan | Cluster, score, persist, push via WebSocket |
+| DB cleanup | Daily at 03:00 | Removes data older than 30 days |
 
 ---
 
 ## How scoring works
 
-Every discovered situation receives a score from 1.0 to 10.0 computed from three independent signals. This is not a black box -- the formula is deterministic and auditable.
+Every discovered situation receives a score from 1.0 to 10.0 computed from three independent signals. The formula is deterministic and auditable.
 
 ### Score components
 
@@ -88,37 +108,47 @@ FINAL_SCORE = min(10, VOLUME + SEVERITY + TONE)
 
 **1. Volume score (0 to 8 points)**
 
-How heavily is this situation being reported? Raw function: `min(article_count / 4, 8)`.
+How heavily is this situation being reported? RSS and DOC articles are weighted 1.5x compared to raw GDELT geo-events (0.5x each), reflecting the difference in signal quality.
 
-| Articles in cluster | Volume score |
-|---------------------|-------------|
-| 4 | 1.0 |
-| 8 | 2.0 |
-| 16 | 4.0 |
-| 32+ | 8.0 (cap) |
-
-The divisor of 4 was chosen empirically. Most noise clusters have 2-3 events. Anything above 15 articles in 24 hours for a single geographic cluster is significant by any standard.
+| Effective article count | Volume score |
+|------------------------|-------------|
+| 4 | ~2.0 |
+| 8 | ~4.0 |
+| 16+ | 8.0 (cap) |
 
 **2. Severity keyword score (0 to 3 points)**
 
-The system scans all headlines in the cluster for escalation-indicative language, using three tiers:
+Scans headlines for escalation-indicative language in three tiers:
 
-| Tier | Score | Terms |
-|------|-------|-------|
-| Critical | 3 | war, killed, airstrike, bombing, massacre, genocide, invasion, missile, casualties, death toll, execution, shelling |
-| Elevated | 2 | conflict, fighting, attack, troops, military, clash, violence, crisis, hostage, artillery, drone, refugee, displacement, humanitarian |
-| Moderate | 1 | tension, sanctions, protest, unrest, dispute, threat, escalation, opposition, riot, detain, arrest |
+| Tier | Score | Examples |
+|------|-------|---------|
+| Critical | 3 | war, killed, airstrike, bombing, massacre, genocide, invasion, missile, casualties, death toll |
+| Elevated | 2 | conflict, fighting, attack, troops, military, clash, violence, crisis, hostage, artillery, drone, refugee |
+| Moderate | 1 | tension, sanctions, protest, unrest, dispute, threat, escalation, riot, detain, arrest |
 
-Only the highest matching tier scores. This prevents double-counting a cluster that has both "war" and "protest" -- the critical tier dominates.
+Only the highest matching tier scores. Headlines from RSS/DOC sources are prioritised over GDELT geo-event names.
 
 **3. Tone score (0 to 2 points)**
 
-Derived from sentiment analysis of the news coverage. Two data sources feed this:
+Derived from sentiment analysis. Two separate pipelines feed this:
 
-- **GDELT events**: GDELT provides a native tone score (-10 to +10) from their global content analysis.
-- **RSS headlines**: Locally computed using the `sentiment` NLP package, normalised to the same -10 to +10 scale.
+- **GDELT events**: GDELT provides a native tone score computed by their production NLP pipeline.
+- **RSS headlines**: Locally computed using a **custom geopolitical sentiment lexicon** (120+ terms) that overrides the base AFINN dictionary. This fixes chronic misscoring of conflict language -- "strike" scores -4 instead of AFINN's -1, "ceasefire" scores +2 instead of 0, "casualties" scores -5 instead of -2.
 
-The conversion: `tone_score = min(2, max(0, -average_tone / 5))`. A perfectly neutral tone scores 0. Extremely negative coverage scores up to 2.
+The conversion: `tone_score = min(2, max(0, -average_tone / 5))`.
+
+### Confidence tiers
+
+New in v3: situations are assigned a confidence level based on source diversity, which directly affects scoring:
+
+| Confidence | Condition | Effect |
+|------------|-----------|--------|
+| **high** | 3+ RSS or DOC articles | Full scoring |
+| **normal** | 1+ RSS or DOC article | Full scoring |
+| **low** | Only GDELT geo-events (8+) | Score capped at 3.9 |
+| **noise** | Too few events, no articles | Discarded entirely |
+
+Low-confidence situations appear as dashed, dimmed dots on the map. They cannot reach elevated or critical status until confirmed by article coverage. This prevents GDELT satellite noise from generating false alarms.
 
 ### Status classification
 
@@ -128,41 +158,62 @@ The conversion: `tone_score = min(2, max(0, -average_tone / 5))`. A perfectly ne
 | Elevated | 4.0 - 6.4 | Orange |
 | Stable | Below 4.0 | Green |
 
-### An honest assessment of this scoring model
+### An honest assessment
 
-It works well for high-signal situations (wars, active military operations, major crises) where volume and keyword severity align. It is weaker for slow-burn situations -- a diplomatic fallout that produces 3 carefully worded articles will score low despite being consequential. The tone component helps slightly but sentiment analysis on headlines is a blunt instrument. A future version would benefit from tracking score trends over time rather than relying on a single-cycle snapshot.
+The scoring model works well for high-signal situations where volume, keyword severity, and tone align. The confidence system meaningfully reduces false positives from GDELT-only data. Weaknesses remain: slow-burn diplomatic situations that produce few articles score low despite being consequential. The severity keywords are still a hardcoded list -- the `ARCHITECTURE_PLAN.md` documents the path toward replacing them with GDELT CAMEO event codes, which would be data-driven rather than hand-maintained.
+
+---
+
+## Noise filtering
+
+Sports, entertainment, and other non-geopolitical content is filtered before clustering. The filter uses a two-tier approach:
+
+- **Strong terms** (>7 characters): A single match like "championship" or "tournament" triggers noise classification, unless 2+ geopolitical severity terms are also present (handles cases like "Olympic boycott").
+- **Weak terms** (<=7 characters): Requires 3+ simultaneous matches to trigger (avoids false positives on short ambiguous words).
+
+The `ARCHITECTURE_PLAN.md` documents an improvement path where GDELT CAMEO codes replace keyword lists entirely -- events with CAMEO codes are geopolitical by definition, no filter needed.
 
 ---
 
 ## Situation summarisation
 
-The Situation field in the side panel is generated by an extractive summarisation engine built into the discovery pipeline. This is not an LLM or a generative model -- it is a deterministic TF-IDF sentence ranker that selects the most informative sentences from the available news coverage.
+The Situation field in the side panel is generated by an extractive summarisation engine. This is not an LLM -- it is a deterministic TF-IDF sentence ranker that selects the most informative sentences from available news coverage.
 
 ### How it works
 
 ```mermaid
 flowchart TD
-    A["Collect RSS snippets<br/>(article excerpts from all events in cluster)"] --> B{"Snippets available?"}
-    B -->|Yes| C["Combine into corpus"]
-    C --> D["Split into sentences"]
-    D --> E["Score each sentence via TF-IDF"]
+    A["Collect RSS + DOC snippets<br/>(article excerpts from cluster)"] --> B{"Snippets available?"}
+    B -->|Yes| C["Combine into corpus, split sentences"]
+    C --> D["Score each sentence via TF-IDF"]
+    D --> E["Filter noise sentences (score * 0.1)"]
     E --> F["Select top 2-3 sentences"]
     F --> G["Re-order by original position"]
     G --> H["Return as coherent paragraph"]
 
-    B -->|No headlines| I{"Headlines available?"}
-    I -->|Yes| J["Return top 3 headlines<br/>(dot-separated)"]
-    I -->|No| K["Generate contextual fallback<br/>(GDELT satellite description)"]
+    B -->|No| I{"Headlines available?"}
+    I -->|Yes| J["Filter noise headlines"]
+    J --> K["Return top 3 (dot-separated)"]
+    I -->|No| L["Generate contextual fallback<br/>(GDELT metadata inference)"]
 ```
 
-The TF-IDF scoring works by computing term frequency (how often a word appears in a sentence) multiplied by inverse document frequency (how unique that word is across all sentences). Sentences with many rare, topic-specific words score higher than sentences full of common language. This consistently surfaces the most informative sentence in a cluster without requiring any external API calls.
+The TF-IDF scoring computes term frequency multiplied by inverse document frequency. Sentences with rare, topic-specific words score higher than generic language. Sentences that match the noise filter have their score reduced by 90%. This runs entirely locally with zero external API calls.
 
-### Fallback chain
+---
 
-1. **RSS snippets available**: Full extractive summary from article excerpts (best quality)
-2. **Only headlines available**: Top 3 unique headlines joined by dots
-3. **GDELT-only data**: Contextual description synthesised from satellite event metadata (military activity, border crossings, etc.)
-4. **Nothing matches filters**: Generic monitoring statement with event count
+## Geopolitical sentiment lexicon
+
+The default AFINN sentiment dictionary was built for product reviews and social media. It systematically underweights conflict language. The custom `GEO_LEXICON` in `feeds.js` overrides 120+ terms:
+
+| Term | AFINN default | Geopolitical override | Rationale |
+|------|--------------|----------------------|-----------|
+| strike | -1 | -4 | AFINN treats this as a labor dispute. In geopolitics, it means airstrike. |
+| collapse | -2 | -4 | "Government collapse" is not mildly negative. |
+| casualties | -2 | -5 | Any headline mentioning casualties is severe. |
+| ceasefire | 0 | +2 | AFINN has no entry. A ceasefire is positive in conflict monitoring. |
+| invasion | 0 | -5 | AFINN has no entry. |
+
+The lexicon also scores de-escalation terms positively (ceasefire +2, peace talks +3, reconciliation +3) so the tone component correctly reflects improving situations, not just worsening ones.
 
 ---
 
@@ -170,7 +221,7 @@ The TF-IDF scoring works by computing term frequency (how often a word appears i
 
 ### GDELT GEO 2.0
 
-The [GDELT Project](https://www.gdeltproject.org/) monitors broadcast, print, and web news across the world in over 100 languages. The GEO 2.0 API returns geolocated events matching thematic queries. This project queries five themes every 10 minutes:
+Returns geolocated events matching thematic queries. Five themes queried every 10 minutes:
 
 - Conflict (war, fighting, battle)
 - Crisis (humanitarian, refugee, famine)
@@ -178,85 +229,138 @@ The [GDELT Project](https://www.gdeltproject.org/) monitors broadcast, print, an
 - Unrest (protest, riot, uprising)
 - Tension (sanctions, nuclear, standoff)
 
-Each query returns up to 75 geolocated events with coordinates, article references, and tone scores. Events at (0, 0) are filtered as geocoding errors.
+Each query returns up to 75 geolocated events with coordinates, article references, and tone scores.
+
+### GDELT DOC 2.0 (new in v3)
+
+Returns actual articles with pre-extracted metadata. The first 3 themes are also queried via the DOC API, which provides:
+- Article titles and URLs
+- Source country and language
+- Domain information
+- Pre-extracted country mentions (used for geocoding)
+
+DOC results are interleaved with GEO queries to stay within GDELT's rate budget.
 
 ### RSS feeds
 
-Nine RSS feeds are polled every 5 minutes:
+Nine feeds polled every 5 minutes:
 
 | Source | Type | Notes |
 |--------|------|-------|
 | BBC World | Mainstream | Reliable, broad coverage |
 | Al Jazeera | Mainstream | Strong Middle East and Global South coverage |
-| Reuters | Wire service | Currently returning DNS errors (feed URL may have changed) |
-| AP News | Wire service | Returns 403s intermittently (likely bot detection) |
+| Reuters | Wire service | Intermittent DNS errors |
+| AP News | Wire service | Intermittent 403s |
 | Counterpunch | Independent/Left | US foreign policy criticism, investigative |
 | Declassified UK | Independent | UK foreign and military policy, FOIA-based |
-| RT News | State-funded (Russia) | Included deliberately for perspective diversity, not as trusted source |
-| Mint Press News | Independent | Middle East focus, critical of Western policy |
+| RT News | State-funded (Russia) | Included for perspective diversity |
+| Mint Press News | Independent | Middle East focus |
 | The Grayzone | Independent | Investigative, adversarial to establishment narratives |
 
-The source selection is intentionally heterogeneous. The scoring engine does not weight sources differently -- a BBC headline and an RT headline contribute equally to the volume and keyword scores. The rationale is that for a monitoring tool, detecting that a situation is being discussed across ideologically opposed outlets is itself a signal of significance.
+The source selection is intentionally heterogeneous. The scoring engine does not weight sources differently. Detecting that a situation is discussed across ideologically opposed outlets is itself a signal of significance.
+
+---
+
+## Persistence (new in v3)
+
+SQLite (via `better-sqlite3`) stores situation history, articles, and escalation events. The database enables:
+
+### What is persisted
+
+| Table | Contents | Retention |
+|-------|----------|-----------|
+| `snapshots` | Full situation state per discovery cycle | 30 days |
+| `articles` | Top articles linked to each situation | 30 days |
+| `escalations` | Status change events with timestamps | 30 days |
+
+### APIs powered by persistence
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/trends?hours=24` | All situations with score direction (up/down/stable) and delta |
+| `GET /api/trends/:name?days=7` | Score history for a specific situation (for trend lines) |
+| `GET /api/escalations?limit=50` | Chronological escalation history |
+| `GET /api/stats` | Database statistics (snapshot count, article count, DB size) |
+| `GET /api/health` | Server uptime, activity count, DB status |
+
+### State recovery
+
+On restart, the server recovers the `previousStates` map from the most recent snapshot. This means escalation detection works correctly across server restarts -- no data loss, no false re-escalations.
+
+---
+
+## Authentication (new in v3)
+
+Optional HTTP Basic Auth, controlled by environment variables:
+
+```bash
+AUTH_PASSWORD=your_secret_here
+AUTH_USER=monitor    # defaults to "monitor"
+```
+
+When `AUTH_PASSWORD` is set:
+- All HTTP endpoints require Basic Auth (except `/api/health`)
+- WebSocket connections require either Basic Auth headers or a `?token=` query parameter
+- The login prompt appears automatically in browsers
+
+When `AUTH_PASSWORD` is unset (default), authentication is disabled entirely.
 
 ---
 
 ## Clustering
 
-Events are grouped using a single-pass greedy clustering algorithm with a 500km radius (haversine distance). This is not k-means or DBSCAN -- it is a much simpler approach:
+Events are grouped using a single-pass greedy algorithm with a 500km Haversine radius:
 
 1. For each incoming event, check if it falls within 500km of any existing cluster center.
-2. If yes, add it to that cluster and update the center (rolling average).
+2. If yes, add it and update the center (rolling average).
 3. If no, create a new cluster.
-4. Discard clusters with fewer than 2 events (noise filtering).
-
-The 500km radius was chosen to group events that belong to the same regional conflict without merging distinct situations. It correctly groups "Kyiv shelling" and "Kherson offensive" into a single Ukraine situation while keeping "Moldova political crisis" separate.
-
-**Trade-off**: This radius is too wide for dense regions (the Levant) and too narrow for sprawling conflicts (the Sahel). A production system would use adaptive radii based on regional density.
+4. Discard clusters with fewer than 2 events.
 
 ### Naming
 
-Situations are auto-named by extracting the two most-mentioned countries from the cluster's headlines, sorted alphabetically. "Ukraine - Russia" and "Russia - Ukraine" are always normalised to "Russia - Ukraine". When only GDELT geo-data is available (no country mentions in headlines), the nearest entry in the 127-country gazetteer is used.
+Situations are auto-named by extracting the two most-mentioned countries from the cluster's headlines, sorted alphabetically. When only GDELT geo-data is available, the nearest entry in the `countries-data.js` ISO gazetteer is used via `findNearest()`.
+
+### Limitation
+
+The 500km radius is too wide for dense regions (the Levant) and too narrow for sprawling conflicts (the Sahel). The `ARCHITECTURE_PLAN.md` documents a path toward density-adaptive clustering and country-pair-based grouping.
 
 ---
 
-## Escalation notifications
+## Country data (`countries-data.js`)
 
-The system tracks the status of every discovered situation across discovery cycles. When a situation's status worsens (e.g., stable to elevated, elevated to critical), an escalation event fires.
+Replaces the v2 hand-maintained gazetteer with ISO 3166-1 standard data. 150+ countries with:
+- ISO alpha-2 codes
+- Representative coordinates (capital city)
+- Major cities (for sub-national matching)
+- Official abbreviations (UK, US, UAE, etc.)
 
-### What happens on escalation
-
-1. **Server side**: The `detectEscalations()` function compares current statuses against a `previousStates` map. Any upward movement triggers a WebSocket `escalation` message.
-2. **Client side**:
-   - The notification bell in the header lights up with a count badge
-   - A pulsating animation plays on the bell
-   - An auditory alert plays (two-tone ascending via Web Audio API)
-   - A browser notification is dispatched (if permissions granted)
-   - The relevant map dot flashes briefly
-   - The escalation is logged in the notification dropdown with timestamp
-
-The system only alerts on escalations, not de-escalations. A situation moving from critical to elevated does not trigger a notification. This is to prevent alert fatigue from situations that oscillate near a threshold boundary.
+A fast lookup index is built at load time from the structured data, rather than maintaining a separate lookup table. The `extractCountries()` function uses word-boundary regex matching against country names, capitals, cities, and abbreviations.
 
 ---
 
 ## Frontend
 
-The frontend is a single `index.html` file containing 72KB of HTML, CSS, and JavaScript. No framework, no build tools, no transpilation. The map is an SVG-based Equirectangular projection rendered inline.
+The frontend is a single `index.html` file. No framework, no build tools.
+
+### D3.js + TopoJSON map (new in v3)
+
+Replaces the v2 hand-drawn SVG continent blobs with a real world map:
+- **Natural Earth 1 projection** -- good balance of area and shape distortion
+- **Natural Earth 110m TopoJSON** loaded from CDN (~100KB)
+- **Country hover** -- highlights country boundaries and shows name
+- **ISO 3166-1 numeric mapping** built into the frontend for labeling features
+- **Activity dots** sized and styled by confidence (low-confidence dots are smaller and dimmer)
+- **Connection lines** between nearby non-stable situations
 
 ### Key UI components
 
-- **SVG world map**: Country paths with pulsating activity dots coloured by status
-- **Activity strip**: Horizontal scrollable bar of all discovered situations, sorted by severity
-- **Side panel**: Full detail view with score breakdown, situation summary, parties involved, and related coverage links
-- **News river**: Right-side feed showing the latest headlines from all RSS sources with source tags and tone scores
-- **Notification bell**: Escalation alert system with dropdown history
-- **Status bar**: Live counts of critical/elevated/stable situations and real-time clock
-
-### Interaction model
-
-- Click a dot on the map or a strip item to open the side panel
-- Hover over a dot for a tooltip with name, type, and score
-- Click a news item to open the source article in a new tab
-- Click the bell to view/clear escalation history
+- **SVG world map**: D3-rendered country paths with pulsating activity dots
+- **Confidence indicators**: Dashed borders and dimmed dots for low-confidence (satellite-only) situations
+- **Activity strip**: Scrollable sidebar list sorted by severity, low-confidence items visually distinguished
+- **Side panel**: Score breakdown, confidence badge, situation summary, related coverage with tone scores
+- **News river**: Right-side feed with source tags
+- **Notification bell**: Escalation alerts with audio (Web Audio API) and browser notifications
+- **Status bar**: Live counts + UTC clock
 
 ---
 
@@ -265,45 +369,62 @@ The frontend is a single `index.html` file containing 72KB of HTML, CSS, and Jav
 ### Requirements
 
 - Node.js 18+ (tested on 20.x and 22.x)
-- An internet connection (GDELT API + RSS feeds are remote)
+- Internet connection (GDELT API + RSS feeds are remote)
 - No API keys required
 
 ### Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/global-activity-monitor.git
+git clone https://github.com/ashioyajotham/global-activity-monitor.git
 cd global-activity-monitor
 npm install
 node server.js
 ```
 
-Open `http://localhost:4000` in a browser. The first discovery cycle takes about 60 seconds (GDELT rate limiting introduces 2-second delays between theme queries). After the initial load, data refreshes automatically.
+Open `http://localhost:4000`. The first discovery cycle takes about 60 seconds (GDELT rate limiting). Data refreshes automatically after that.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | 4000 | Server port |
+| `AUTH_PASSWORD` | _(empty)_ | Set to enable Basic Auth |
+| `AUTH_USER` | monitor | Username for Basic Auth |
+| `DB_PATH` | ./monitor.db | SQLite database file path |
 
-That is the only configurable parameter. Everything else is tuned in the source.
+### Database management
+
+```bash
+# Manual cleanup (keep last 30 days)
+npm run cleanup
+
+# Check health
+curl http://localhost:4000/api/health
+
+# View trends
+curl http://localhost:4000/api/trends?hours=24
+
+# View specific situation history
+curl http://localhost:4000/api/trends/Iran%20-%20United%20States?days=7
+```
 
 ---
 
-## Known limitations and candid notes
+## Known limitations
 
-**No persistence.** State lives in memory. If the server restarts, all historical data is lost. A production version would need at minimum a SQLite store for situation history and score trends.
+**Keyword-based classification.** Severity scoring and noise filtering still use hardcoded term lists. The `ARCHITECTURE_PLAN.md` documents the path toward GDELT CAMEO event codes, which would replace keyword guessing with structured classification data.
 
-**No authentication.** This is a local tool. Exposing it to the internet without auth is inadvisable.
+**Fixed cluster radius.** 500km is too wide for the Levant, too narrow for Russia. Density-adaptive or country-pair clustering would be more accurate.
 
-**GDELT rate limiting.** The 2-second delay between theme queries is defensive. GDELT does not document their rate limits precisely, so the system errs on the side of caution. This means a full scan takes ~40-60 seconds.
+**Static score thresholds.** 6.5/4.0 do not adapt to global baseline. On a quiet day, nothing hits critical. On a crisis day, everything does. Percentile-based thresholds would self-calibrate.
 
-**RSS fallibility.** Reuters and AP feeds frequently return errors (DNS failures, 403s). The system logs these and continues. Losing two feeds out of nine does not meaningfully degrade coverage for most situations, but it does create blind spots for wire-service-exclusive stories.
+**English-language bias.** All 9 RSS feeds are English. The GDELT DOC API partially compensates (it indexes 150+ countries in all languages), but article snippets used for summarisation are English-only.
 
-**Sentiment analysis is shallow.** The `sentiment` package does bag-of-words analysis. It does not understand sarcasm, context, or negation well. A headline like "Peace talks collapse" might score mildly negative when a human would read it as alarming. The GDELT tone scores are more sophisticated but are only available for satellite events, not RSS headlines.
+**Sentiment is still bag-of-words.** The custom lexicon improves on AFINN but cannot handle negation ("no casualties reported" still scores negative) or sarcasm. GDELT's production tone scores are more sophisticated but only available for GDELT-sourced events.
 
-**Clustering is naive.** The greedy single-pass approach has known failure modes: insertion order affects cluster assignment, and the rolling center average can drift if early events are outliers. For the scale of data this system processes (~500 events per cycle), these edge cases rarely manifest.
+**No authentication by default.** Exposing to the internet without setting `AUTH_PASSWORD` is inadvisable.
 
-**No historical tracking.** The system shows a 24-hour snapshot. It cannot answer "is this situation getting worse over the past week?" Future work would involve persisting scores and computing trend lines.
+**GDELT rate limits.** The 2.2s delay between requests is conservative. Interleaving GEO and DOC queries doubles the useful data but also doubles scan time to ~50-70 seconds per cycle.
 
 ---
 
@@ -311,59 +432,61 @@ That is the only configurable parameter. Everything else is tuned in the source.
 
 | Package | Purpose | Why this one |
 |---------|---------|-------------|
-| `express` | HTTP server | Industry standard, minimal footprint |
+| `express` | HTTP server | Standard, minimal |
 | `ws` | WebSocket server | Lightweight, no Socket.io overhead |
-| `node-cron` | Scheduled tasks | Simple cron syntax for polling intervals |
-| `rss-parser` | RSS feed parsing | Handles RSS 2.0 and Atom, 10s timeout |
-| `sentiment` | NLP tone scoring | Zero-dependency, bag-of-words, fast |
-| `node-summarizer` | TextRank reference | Installed but the extractive summariser is custom-built using TF-IDF directly in `discovery.js` |
-| `cors` | Cross-origin headers | Allows local development from different ports |
+| `better-sqlite3` | SQLite persistence | Synchronous API (no async complexity), zero-config, fast |
+| `node-cron` | Scheduled tasks | Simple cron syntax |
+| `rss-parser` | RSS feed parsing | Handles RSS 2.0 and Atom |
+| `sentiment` | NLP tone baseline | Zero-dependency, extended with custom lexicon |
+| `cors` | Cross-origin headers | Local development support |
 
-Total `node_modules` footprint is under 5MB. There are no native bindings, no C++ compilation steps, and no transitive dependency nightmares.
+Frontend dependencies loaded from CDN (no node_modules):
+- `d3` v7.9.0 -- map projection and rendering
+- `topojson-client` v3.0.2 -- TopoJSON feature extraction
 
 ---
 
 ## File-by-file breakdown
 
-### `server.js` (369 lines)
+### `server.js` (254 lines)
 
-The orchestration layer. Handles:
-- Express server setup and static file serving
-- WebSocket connection management and message broadcasting
-- GDELT GEO API fetching (sequential with rate-limiting delays)
-- News-to-events conversion (geocoding headlines via the gazetteer)
-- Discovery pipeline execution (calls into `discovery.js`)
-- Escalation detection (state comparison across cycles)
-- Cron scheduling (10-min discovery scans, 5-min news refreshes)
+Orchestration layer. Express server, WebSocket management, GDELT GEO + DOC fetchers (interleaved with rate-limiting), news-to-events geocoding, discovery pipeline execution, escalation detection with state recovery, basic auth middleware, REST API endpoints for trends/stats/health, cron scheduling, graceful shutdown.
 
-### `discovery.js` (689 lines)
+### `discovery.js` (306 lines)
 
-The analytical core. Contains:
-- **Gazetteer**: 127 countries/territories with coordinates and 400+ aliases for location extraction
-- **Location extraction**: Regex-based entity recognition with word boundary matching
-- **GDELT parsing**: GeoJSON response normalisation with HTML tag stripping
-- **Clustering**: Haversine-distance greedy clustering (500km radius)
-- **Auto-naming**: Country extraction + alphabetical normalisation
-- **Scoring**: Three-component severity formula (volume + keywords + tone)
-- **Categorisation**: 12 category patterns (War, Armed Conflict, Terrorism, Maritime Dispute, etc.)
-- **Summarisation**: TF-IDF extractive summariser with sentence scoring and positional re-ordering
-- **Party extraction**: Top 4 countries mentioned across cluster headlines
+Analytical core. Noise classification and filtering, GDELT GEO/DOC response parsing, haversine clustering, confidence assessment, auto-naming (country extraction + alphabetical normalisation), TF-IDF extractive summarisation with noise sentence demotion, 12-category classification, three-component severity scoring with confidence caps, party extraction, deduplication.
 
-### `feeds.js` (117 lines)
+### `countries-data.js` (347 lines)
 
-RSS ingestion. Fetches 9 feeds, runs each headline through `sentiment` for tone scoring, deduplicates by title similarity, and returns normalised news items with title, link, source, snippet, tone, and timestamp.
+ISO 3166-1 standard country data. 150+ countries with coordinates, capitals, major cities, and official abbreviations. Fast lookup index built at load time. `extractCountries()` for headline geocoding, `findNearest()` for reverse geocoding GDELT coordinates.
 
-### `index.html` (1939 lines)
+### `feeds.js` (259 lines)
 
-The entire frontend in a single file. Contains inline CSS, an SVG world map with country paths, and JavaScript for:
-- WebSocket connection and message handling
-- Map rendering with pulsating activity dots
-- Side panel with full situation breakdowns
-- Activity strip (horizontal scrollbar of situations)
-- News river (real-time feed display)
-- Notification bell with escalation history
-- Alert sounds via Web Audio API
-- Browser notification integration
+RSS ingestion with enhanced sentiment. 120+ term geopolitical lexicon overriding AFINN defaults. Fetches 9 feeds, runs enhanced tone analysis, deduplicates by title similarity. Exports `analyzeGeopoliticalTone()` and `GEO_LEXICON` for transparency.
+
+### `db.js` (294 lines)
+
+SQLite persistence via `better-sqlite3`. Schema: `snapshots`, `articles`, `escalations` tables. Write operations: `storeSituations()`, `storeArticles()`, `storeEscalation()`. Trend queries: `getScoreTrend()`, `getAllTrends()`. State recovery: `recoverPreviousStates()`. Maintenance: `cleanup()` with configurable retention.
+
+### `index.html` (561 lines)
+
+Complete frontend. D3.js Natural Earth projection, TopoJSON country rendering with ISO 3166-1 labeling, confidence-aware dot sizing, connection lines between proximate situations, activity strip with confidence styling, side panel with score + confidence breakdown, news river, notification bell with Web Audio alerts, responsive layout.
+
+### `ARCHITECTURE_PLAN.md` (345 lines)
+
+Hardcoding audit documenting 12 categories of brittle keyword lists in the codebase, with concrete alternatives for each. Proposes a 3-wave improvement path: Wave 1 (map + DOC API, completed), Wave 2 (CAMEO codes replace keyword lists), Wave 3 (adaptive clustering + percentile thresholds).
+
+---
+
+## Roadmap
+
+The `ARCHITECTURE_PLAN.md` contains the full technical audit. Summary of what is done and what remains:
+
+| Wave | Status | Description |
+|------|--------|-------------|
+| Wave 1 | Done | Real TopoJSON map, GDELT DOC API, ISO country data, SQLite persistence |
+| Wave 2 | Planned | CAMEO event codes replace severity keywords and category patterns |
+| Wave 3 | Planned | Density-adaptive clustering, percentile-based score thresholds, source diversity scoring |
 
 ---
 

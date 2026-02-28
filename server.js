@@ -1,9 +1,6 @@
 /**
  * server.js — Global Activity Monitor Backend
- * 
- * Autonomous discovery: no hardcoded regions.
- * Uses GDELT GEO 2.0 for broad event scanning and RSS
- * feeds for headline-based location extraction.
+ * v3: Dual GDELT source (GEO + DOC APIs), SQLite persistence, basic auth.
  */
 
 const express = require('express');
@@ -15,354 +12,242 @@ const http = require('http');
 
 const { fetchAllNews } = require('./feeds');
 const {
-    GEO_THEMES,
-    buildGeoQuery,
-    parseGeoResponse,
-    extractLocations,
-    discoverSituations,
+    GEO_THEMES, buildGeoQuery, parseGeoResponse,
+    buildDocQuery, parseDocResponse,
+    extractCountries, discoverSituations,
 } = require('./discovery');
+const db = require('./db');
 
-// ═══════════════════════════════════════════════════════
-// CONFIG
-// ═══════════════════════════════════════════════════════
 const PORT = process.env.PORT || 4000;
-const GDELT_FETCH_INTERVAL = '*/10 * * * *'; // every 10 minutes
-const NEWS_FETCH_INTERVAL = '*/5 * * * *';   // every 5 minutes
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || null;
+const AUTH_USER = process.env.AUTH_USER || 'monitor';
 
 // ═══════════════════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════════════════
+
 let cachedActivities = [];
 let cachedNews = [];
 let dataSource = 'bootstrap';
 let lastGdeltFetch = null;
 let lastNewsFetch = null;
-
-// Escalation tracking: map situation name → previous status
-const previousStates = new Map();
+let discoveryCount = 0;
+let previousStates = new Map();
 const STATUS_RANK = { stable: 0, elevated: 1, critical: 2 };
 
-/**
- * Compare new situations against previous states.
- * Returns array of escalation events.
- */
 function detectEscalations(newSituations) {
     const escalations = [];
-
     for (const sit of newSituations) {
-        const prevStatus = previousStates.get(sit.name);
-        const newRank = STATUS_RANK[sit.status] ?? 0;
-        const prevRank = prevStatus ? (STATUS_RANK[prevStatus] ?? 0) : -1;
-
-        if (prevStatus && newRank > prevRank) {
-            escalations.push({
-                name: sit.name,
-                from: prevStatus,
-                to: sit.status,
-                score: sit.score,
-                type: sit.type,
-                lat: sit.lat,
-                lng: sit.lng,
-                time: new Date().toISOString(),
-            });
-            console.log(`[ESCALATION] ${sit.name}: ${prevStatus} → ${sit.status} (score: ${sit.score})`);
+        const prev = previousStates.get(sit.name);
+        const newR = STATUS_RANK[sit.status] ?? 0;
+        const prevR = prev ? (STATUS_RANK[prev] ?? 0) : -1;
+        if (prev && newR > prevR) {
+            const esc = { name: sit.name, from: prev, to: sit.status, score: sit.score, type: sit.type, lat: sit.lat, lng: sit.lng, time: new Date().toISOString() };
+            escalations.push(esc);
+            try { db.storeEscalation(esc); } catch (e) { console.error('[db]', e.message); }
+            console.log(`[ESCALATION] ${sit.name}: ${prev} → ${sit.status} (${sit.score})`);
         }
-
         previousStates.set(sit.name, sit.status);
     }
-
     return escalations;
 }
 
 // ═══════════════════════════════════════════════════════
-// EXPRESS APP
-// ═══════════════════════════════════════════════════════
-const app = express();
-app.use(cors());
-
-// Serve frontend
-app.use(express.static(path.join(__dirname)));
-
-// ── REST API ──
-
-app.get('/api/activities', (req, res) => {
-    res.json({
-        activities: cachedActivities,
-        source: dataSource,
-        lastFetch: lastGdeltFetch,
-        count: cachedActivities.length,
-    });
-});
-
-app.get('/api/news', (req, res) => {
-    res.json({
-        news: cachedNews,
-        lastFetch: lastNewsFetch,
-        count: cachedNews.length,
-    });
-});
-
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        uptime: process.uptime(),
-        activities: cachedActivities.length,
-        news: cachedNews.length,
-        dataSource,
-    });
-});
-
-// ═══════════════════════════════════════════════════════
-// GDELT GEO FETCHER
+// AUTH
 // ═══════════════════════════════════════════════════════
 
-/**
- * Fetch geolocated events from GDELT GEO 2.0 for one theme.
- */
-async function fetchGeoTheme(theme) {
-    const url = buildGeoQuery(theme.query);
-
-    try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
-
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: { 'User-Agent': 'GlobalActivityMonitor/2.0' },
-        });
-        clearTimeout(timeout);
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const contentType = response.headers.get('content-type') || '';
-        const text = await response.text();
-
-        // GDELT sometimes returns HTML errors
-        if (!contentType.includes('json') && !text.startsWith('{')) {
-            throw new Error('Non-JSON response from GDELT');
-        }
-
-        const data = JSON.parse(text);
-        const events = parseGeoResponse(data);
-        console.log(`[gdelt-geo] ${theme.label}: ${events.length} events`);
-        return events;
-    } catch (err) {
-        console.error(`[gdelt-geo] Error for ${theme.label}:`, err.message);
-        return [];
-    }
+function authMiddleware(req, res, next) {
+    if (!AUTH_PASSWORD) return next();
+    if (req.path === '/api/health') return next();
+    const h = req.headers.authorization;
+    if (!h || !h.startsWith('Basic ')) { res.set('WWW-Authenticate', 'Basic realm="Monitor"'); return res.status(401).send('Auth required'); }
+    try { const [u, p] = Buffer.from(h.split(' ')[1], 'base64').toString().split(':'); if (u === AUTH_USER && p === AUTH_PASSWORD) return next(); } catch {}
+    res.set('WWW-Authenticate', 'Basic realm="Monitor"'); res.status(401).send('Invalid credentials');
 }
 
-/**
- * Fetch all GDELT GEO themes and merge events.
- */
+function authenticateWs(req) {
+    if (!AUTH_PASSWORD) return true;
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.searchParams.get('token') === AUTH_PASSWORD) return true;
+    const h = req.headers.authorization;
+    if (h?.startsWith('Basic ')) { try { const [u, p] = Buffer.from(h.split(' ')[1], 'base64').toString().split(':'); return u === AUTH_USER && p === AUTH_PASSWORD; } catch {} }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════
+// EXPRESS
+// ═══════════════════════════════════════════════════════
+
+const app = express();
+app.use(cors());
+app.use(authMiddleware);
+app.use(express.static(path.join(__dirname)));
+
+app.get('/api/activities', (_, res) => res.json({ activities: cachedActivities, source: dataSource, lastFetch: lastGdeltFetch, count: cachedActivities.length, discoveryCount }));
+app.get('/api/news', (_, res) => res.json({ news: cachedNews, lastFetch: lastNewsFetch, count: cachedNews.length }));
+app.get('/api/health', (_, res) => { let s = {}; try { s = db.getStats(); } catch (e) { s = { error: e.message }; } res.json({ status: 'ok', uptime: process.uptime(), activities: cachedActivities.length, db: s }); });
+app.get('/api/trends', (req, res) => { try { const h = Math.min(parseInt(req.query.hours)||24, 168); const t = db.getAllTrends(h); res.json({ trends: t.map(r => ({ ...r, direction: r.last_score > r.first_score ? 'up' : r.last_score < r.first_score ? 'down' : 'stable', delta: Math.round((r.last_score - r.first_score)*10)/10 })), hours: h }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.get('/api/trends/:name', (req, res) => { try { const d = Math.min(parseInt(req.query.days)||7, 30); res.json({ name: req.params.name, trend: db.getScoreTrend(req.params.name, d), escalations: db.getEscalationsForSituation(req.params.name, d) }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.get('/api/escalations', (req, res) => { try { const l = Math.min(parseInt(req.query.limit)||50, 200); res.json({ escalations: db.getEscalationHistory(l) }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.get('/api/stats', (_, res) => { try { res.json(db.getStats()); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// ═══════════════════════════════════════════════════════
+// GDELT FETCHERS
+// ═══════════════════════════════════════════════════════
+
+async function fetchWithTimeout(url, ms = 20000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+        const res = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'GlobalActivityMonitor/3.0' } });
+        clearTimeout(timer);
+        return res;
+    } catch (e) { clearTimeout(timer); throw e; }
+}
+
+async function fetchGeoTheme(theme) {
+    try {
+        const res = await fetchWithTimeout(buildGeoQuery(theme.query));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        if (!text.startsWith('{')) throw new Error('Non-JSON');
+        const events = parseGeoResponse(JSON.parse(text));
+        console.log(`[gdelt-geo] ${theme.label}: ${events.length} events`);
+        return events;
+    } catch (e) { console.error(`[gdelt-geo] ${theme.label}: ${e.message}`); return []; }
+}
+
+async function fetchDocTheme(theme) {
+    try {
+        const res = await fetchWithTimeout(buildDocQuery(theme.query));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const articles = parseDocResponse(data);
+        console.log(`[gdelt-doc] ${theme.label}: ${articles.length} geolocated articles`);
+        return articles;
+    } catch (e) { console.error(`[gdelt-doc] ${theme.label}: ${e.message}`); return []; }
+}
+
 async function fetchAllGeoEvents() {
-    console.log('[gdelt-geo] Scanning global events across all themes...');
-    const startTime = Date.now();
+    console.log('[gdelt] Scanning global events (GEO + DOC APIs)...');
+    const start = Date.now();
     const allEvents = [];
 
-    // Fetch themes sequentially with delays (GDELT rate limits)
+    // Interleave GEO and DOC calls to stay within rate limits
     for (let i = 0; i < GEO_THEMES.length; i++) {
-        const events = await fetchGeoTheme(GEO_THEMES[i]);
-        allEvents.push(...events);
+        const geoEvents = await fetchGeoTheme(GEO_THEMES[i]);
+        allEvents.push(...geoEvents);
+        await new Promise(r => setTimeout(r, 2200));
 
-        // 2s delay between theme queries
-        if (i < GEO_THEMES.length - 1) {
-            await new Promise(r => setTimeout(r, 2000));
+        // DOC API for first 3 themes (rate budget)
+        if (i < 3) {
+            const docEvents = await fetchDocTheme(GEO_THEMES[i]);
+            allEvents.push(...docEvents);
+            await new Promise(r => setTimeout(r, 2200));
         }
     }
 
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[gdelt-geo] Total: ${allEvents.length} raw events in ${elapsed}s`);
+    console.log(`[gdelt] Total: ${allEvents.length} events in ${((Date.now()-start)/1000).toFixed(1)}s`);
     return allEvents;
 }
 
 // ═══════════════════════════════════════════════════════
-// NEWS → EVENTS CONVERTER
+// NEWS → EVENTS
 // ═══════════════════════════════════════════════════════
 
-/**
- * Convert news items to geolocated events using the gazetteer.
- * Each headline is scanned for country mentions and assigned coordinates.
- */
 function newsToEvents(newsItems) {
     const events = [];
-
     for (const item of newsItems) {
-        const text = `${item.title} ${item.snippet || ''}`;
-        const locations = extractLocations(text);
-
-        for (const loc of locations) {
-            events.push({
-                lat: loc.lat,
-                lng: loc.lng,
-                title: item.title,
-                url: item.link,
-                source: item.source,
-                snippet: item.snippet || '',
-                tone: item.tone || 0,
-            });
+        const countries = extractCountries(`${item.title} ${item.snippet || ''}`);
+        for (const loc of countries) {
+            events.push({ lat: loc.lat, lng: loc.lng, title: item.title, url: item.link, source: item.source, snippet: item.snippet || '', tone: item.tone || 0 });
         }
     }
-
     return events;
 }
 
 // ═══════════════════════════════════════════════════════
-// MAIN DISCOVERY PIPELINE
+// DISCOVERY PIPELINE
 // ═══════════════════════════════════════════════════════
 
-/**
- * Run the full discovery pipeline:
- * 1. Fetch GDELT GEO events (broad thematic scan)
- * 2. Convert RSS news to geolocated events
- * 3. Merge all events
- * 4. Cluster → score → classify
- */
 async function runDiscovery() {
     try {
-        // 1. GDELT GEO events
         const geoEvents = await fetchAllGeoEvents();
-
-        // 2. RSS → events
         const newsEvents = newsToEvents(cachedNews);
-        console.log(`[discovery] News-derived events: ${newsEvents.length}`);
-
-        // 3. Merge
-        const allEvents = [...geoEvents, ...newsEvents];
-        console.log(`[discovery] Total events to cluster: ${allEvents.length}`);
-
-        // 4. Discover situations
-        const situations = discoverSituations(allEvents);
-        console.log(`[discovery] Discovered ${situations.length} active situations`);
+        console.log(`[discovery] News events: ${newsEvents.length}`);
+        const all = [...geoEvents, ...newsEvents];
+        console.log(`[discovery] Total to cluster: ${all.length}`);
+        const situations = discoverSituations(all);
+        console.log(`[discovery] Result: ${situations.length} situations`);
 
         if (situations.length > 0) {
-            // Detect escalations before overwriting cache
             const escalations = detectEscalations(situations);
-
             cachedActivities = situations;
             dataSource = 'live';
             lastGdeltFetch = new Date().toISOString();
-
-            // Push to WebSocket clients
-            broadcast({
-                type: 'activities_update',
-                activities: cachedActivities,
-            });
-
-            // Push escalation alerts
-            if (escalations.length > 0) {
-                broadcast({
-                    type: 'escalation',
-                    escalations,
-                });
-            }
+            discoveryCount++;
+            try { db.storeSituations(situations); for (const s of situations) if (s.topArticles?.length) db.storeArticles(s.topArticles, s.name); console.log(`[db] Cycle #${discoveryCount}: ${situations.length} stored`); } catch (e) { console.error('[db]', e.message); }
+            broadcast({ type: 'activities_update', activities: cachedActivities });
+            if (escalations.length > 0) broadcast({ type: 'escalation', escalations });
         }
-
         return situations;
-    } catch (err) {
-        console.error('[discovery] Pipeline error:', err.message);
-        return cachedActivities;
-    }
+    } catch (e) { console.error('[discovery]', e.message); return cachedActivities; }
 }
-
-// ═══════════════════════════════════════════════════════
-// NEWS FETCHER
-// ═══════════════════════════════════════════════════════
 
 async function refreshNews() {
     try {
         const items = await fetchAllNews();
-        const newCount = items.length - cachedNews.length;
-
         if (items.length > 0) {
-            // Find truly new items
             const oldTitles = new Set(cachedNews.map(n => n.title));
             const newItems = items.filter(n => !oldTitles.has(n.title));
-
-            cachedNews = items.slice(0, 100); // cap at 100
+            cachedNews = items.slice(0, 100);
             lastNewsFetch = new Date().toISOString();
-
-            if (newItems.length > 0) {
-                console.log(`[news] ${newItems.length} new items`);
-                broadcast({
-                    type: 'news_update',
-                    items: newItems.slice(0, 15),
-                });
-            }
+            if (newItems.length > 0) { console.log(`[news] ${newItems.length} new`); broadcast({ type: 'news_update', items: newItems.slice(0, 15) }); }
         }
-
-        console.log(`[update] News cache: ${cachedNews.length} items`);
-    } catch (err) {
-        console.error('[news] Refresh error:', err.message);
-    }
+    } catch (e) { console.error('[news]', e.message); }
 }
 
 // ═══════════════════════════════════════════════════════
-// WEBSOCKET
+// WEBSOCKET + STARTUP
 // ═══════════════════════════════════════════════════════
+
 let wss;
-
-function broadcast(data) {
-    if (!wss) return;
-    const payload = JSON.stringify(data);
-    wss.clients.forEach(client => {
-        if (client.readyState === 1) { // OPEN
-            client.send(payload);
-        }
-    });
-}
-
-// ═══════════════════════════════════════════════════════
-// SERVER STARTUP
-// ═══════════════════════════════════════════════════════
+function broadcast(data) { if (!wss) return; const p = JSON.stringify(data); wss.clients.forEach(c => { if (c.readyState === 1) c.send(p); }); }
 
 async function start() {
+    db.init();
+    try { previousStates = db.recoverPreviousStates(); console.log(`[db] Recovered ${previousStates.size} states`); } catch {}
+
     const server = http.createServer(app);
-
-    // WebSocket
-    wss = new WebSocketServer({ server, path: '/ws' });
-
-    wss.on('connection', (socket) => {
-        console.log('[ws] Client connected');
-
-        // Send current state
-        socket.send(JSON.stringify({
-            type: 'init',
-            activities: cachedActivities,
-            news: cachedNews.slice(0, 30),
-        }));
-
-        socket.on('close', () => console.log('[ws] Client disconnected'));
+    wss = new WebSocketServer({ noServer: true });
+    server.on('upgrade', (req, socket, head) => {
+        if (!authenticateWs(req)) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+    });
+    wss.on('connection', ws => {
+        console.log('[ws] Connected');
+        ws.send(JSON.stringify({ type: 'init', activities: cachedActivities, news: cachedNews.slice(0, 30) }));
+        ws.on('close', () => console.log('[ws] Disconnected'));
     });
 
-    // Start listening
     server.listen(PORT, () => {
         console.log('═══════════════════════════════════════════');
-        console.log('  GLOBAL ACTIVITY MONITOR — DISCOVERY MODE');
+        console.log('  GLOBAL ACTIVITY MONITOR v3');
         console.log('═══════════════════════════════════════════');
-        console.log(`[server] Running on http://localhost:${PORT}`);
-        console.log(`[server] WebSocket on ws://localhost:${PORT}/ws`);
-        console.log('[server] No hardcoded regions. Discovering situations from live data.');
+        console.log(`  http://localhost:${PORT}`);
+        console.log(`  Auth: ${AUTH_PASSWORD ? 'ON' : 'OFF'}`);
+        console.log(`  DB: ${db.getSnapshotCount()} snapshots`);
+        console.log('═══════════════════════════════════════════');
     });
 
-    // ── Scheduled tasks ──
-    cron.schedule(GDELT_FETCH_INTERVAL, runDiscovery);
-    cron.schedule(NEWS_FETCH_INTERVAL, refreshNews);
+    cron.schedule('*/10 * * * *', runDiscovery);
+    cron.schedule('*/5 * * * *', refreshNews);
+    cron.schedule('0 3 * * *', () => db.cleanup(30));
 
-    console.log('[cron] Discovery scan: every 10 minutes');
-    console.log('[cron] News refresh: every 5 minutes');
-
-    // ── Initial data load ──
-    // 1. First fetch news (fast)
     await refreshNews();
-
-    // 2. Then run discovery (slower — GDELT + clustering)
     await runDiscovery();
 }
 
-start().catch(err => {
-    console.error('[fatal]', err);
-    process.exit(1);
-});
+process.on('SIGINT', () => { console.log('\n[shutdown]'); db.close(); process.exit(0); });
+process.on('SIGTERM', () => { db.close(); process.exit(0); });
+start().catch(e => { console.error('[fatal]', e); db.close(); process.exit(1); });
