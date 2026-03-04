@@ -1,7 +1,7 @@
 {
   "name": "global-activity-monitor",
-  "version": "3.0.0",
-  "description": "Real-time autonomous world activity tracker — GDELT GEO + DOC APIs, Natural Earth map, SQLite persistence",
+  "version": "4.0.0",
+  "description": "Autonomous world activity tracker — GDELT theme-classified events, Natural Earth map, SQLite persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

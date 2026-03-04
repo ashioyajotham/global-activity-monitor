@@ -214,7 +214,7 @@
             <div class="legend-item"><span class="legend-dot amber"></span><span>Elevated</span></div>
             <div class="legend-item"><span class="legend-dot green"></span><span>Monitoring</span></div>
         </div>
-        <span class="legend-attribution">Auto-Discovery · GDELT GEO + DOC + RSS · Natural Earth · v3</span>
+        <span class="legend-attribution">Theme-Classified · GDELT GEO + DOC + RSS · Natural Earth · v4</span>
     </footer>
 
     <script>
@@ -457,7 +457,8 @@
             '<h2 class="panel-activity-name">'+act.name+'</h2>'+
             '<div class="panel-badges"><div class="panel-status-badge '+act.status+'"><span class="badge-dot"></span>'+act.status.charAt(0).toUpperCase()+act.status.slice(1)+'</div><span class="panel-score-badge">'+act.score+' / 10</span>'+confBadge+'</div>'+
             '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Type</div><div class="panel-section-value">'+act.type+'</div></div><div class="panel-section"><div class="panel-section-label">Region</div><div class="panel-section-value">'+act.region+'</div></div></div>'+
-            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Coordinates</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+act.lat.toFixed(1)+'°'+(act.lat>=0?'N':'S')+', '+Math.abs(act.lng).toFixed(1)+'°'+(act.lng>=0?'E':'W')+'</div></div><div class="panel-section"><div class="panel-section-label">Articles (24h)</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+(act.articleCount||0)+'</div></div></div>'+
+            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Articles (24h)</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+(act.articleCount||0)+'</div></div><div class="panel-section"><div class="panel-section-label">Source Diversity</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+(act.sourceDiversity||'—')+' unique sources</div></div></div>'+
+            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Coordinates</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+act.lat.toFixed(1)+'°'+(act.lat>=0?'N':'S')+', '+Math.abs(act.lng).toFixed(1)+'°'+(act.lng>=0?'E':'W')+'</div></div><div class="panel-section"><div class="panel-section-label">Classification</div><div class="panel-section-value" style="font-size:11px;color:var(--text-muted)">GDELT theme-classified</div></div></div>'+
             confNote+
             '<div class="panel-section"><div class="panel-section-label">Situation</div><div class="panel-section-value">'+act.description+'</div></div>'+
             '<div class="panel-section"><div class="panel-section-label">Parties Involved</div><div class="panel-parties">'+act.parties.map(p=>'<span class="party-tag">'+p+'</span>').join('')+'</div></div>'+
