@@ -1,41 +1,43 @@
 /**
  * discovery.js — Autonomous Situation Discovery Engine
  *
- * v4: GDELT theme-based classification replaces keyword matching.
- *     No NOISE_TERMS, SEVERITY_TERMS, or CATEGORY_PATTERNS.
- *     GDELT's NLP pipeline does the classification — we just map the results.
+ * v4.1: Hybrid approach — text queries GDELT actually supports + theme metadata tagging.
+ *       GDELT GEO API uses full-text search (not theme: operator).
+ *       Each query is purpose-built to find a category of events,
+ *       and events inherit severity/category from the query that found them.
  *
- * Architecture:
- *   GDELT theme query → events tagged with theme group → severity + category for free
- *   Sports, entertainment etc. never appear because GDELT themes are geopolitical by nature.
+ *       No keyword matching on RESULTS — the classification happens at QUERY TIME.
  */
 
 const { extractCountries, findNearest } = require('./countries-data');
 
 // ═══════════════════════════════════════════════════════
-// GDELT THEME GROUPS
+// THEME GROUPS
 // ═══════════════════════════════════════════════════════
-// Instead of keyword matching on headlines, we query GDELT by its
-// pre-computed themes. Each event comes back already classified.
+// Classification is embedded in the QUERY, not the results.
 //
-// Severity and category are properties of the THEME GROUP
-// that found the event — not keyword-guessed from raw text.
+// "How is this different from keyword matching?"
+//   - Old: fetch everything → scan results for 'war' or 'cricket' → guess category
+//   - New: ask GDELT "give me MILITARY events" → GDELT's NLP filters → tag as military
+//
+// GDELT's GEO API uses full-text queries (not theme: operator).
+// GDELT's DOC API supports theme: prefix for GKG themes.
 
 const THEME_GROUPS = [
     {
         id: 'armed-violence',
         label: 'Armed Conflict',
-        geoQuery: '(theme:KILL OR theme:ARMEDCONFLICT)',
-        docQuery: '(theme:KILL OR theme:ARMEDCONFLICT)',
-        severity: 'critical',     // GDELT decided it's about killing/armed conflict
+        geoQuery: 'killed OR airstrike OR shelling OR bombing OR battle',
+        docQuery: 'killed OR airstrike OR shelling OR bombing',
+        severity: 'critical',
         category: 'Armed Conflict',
-        weight: 1.5,              // scoring multiplier
+        weight: 1.5,
     },
     {
         id: 'military',
         label: 'Military Operations',
-        geoQuery: 'theme:MILITARY',
-        docQuery: 'theme:MILITARY',
+        geoQuery: 'military operation OR troops deployed OR missile OR drone strike',
+        docQuery: 'military operation OR troops deployed OR missile',
         severity: 'critical',
         category: 'Military Operations',
         weight: 1.3,
@@ -43,8 +45,8 @@ const THEME_GROUPS = [
     {
         id: 'terrorism',
         label: 'Terrorism',
-        geoQuery: 'theme:TERROR',
-        docQuery: 'theme:TERROR',
+        geoQuery: 'terrorist attack OR extremist OR suicide bomb OR insurgent',
+        docQuery: 'terrorist attack OR extremist OR suicide bomb',
         severity: 'critical',
         category: 'Terrorism',
         weight: 1.4,
@@ -52,8 +54,8 @@ const THEME_GROUPS = [
     {
         id: 'civil-unrest',
         label: 'Civil Unrest',
-        geoQuery: '(theme:PROTEST OR theme:COUP)',
-        docQuery: '(theme:PROTEST OR theme:COUP)',
+        geoQuery: 'protest OR riot OR uprising OR coup OR revolution',
+        docQuery: 'protest OR riot OR uprising OR coup',
         severity: 'elevated',
         category: 'Civil Unrest',
         weight: 1.1,
@@ -61,8 +63,8 @@ const THEME_GROUPS = [
     {
         id: 'humanitarian',
         label: 'Humanitarian Crisis',
-        geoQuery: '(theme:REFUGEE OR theme:FAMINE OR theme:DISPLACEMENT)',
-        docQuery: '(theme:REFUGEE OR theme:FAMINE OR theme:DISPLACEMENT)',
+        geoQuery: 'refugee OR humanitarian crisis OR famine OR displacement',
+        docQuery: 'refugee crisis OR humanitarian OR famine',
         severity: 'elevated',
         category: 'Humanitarian Crisis',
         weight: 1.2,
@@ -70,8 +72,8 @@ const THEME_GROUPS = [
     {
         id: 'wmd',
         label: 'WMD / Nuclear',
-        geoQuery: 'theme:WMD',
-        docQuery: 'theme:WMD',
+        geoQuery: 'nuclear weapon OR uranium enrichment OR warhead OR WMD',
+        docQuery: 'nuclear weapon OR enrichment OR warhead',
         severity: 'critical',
         category: 'Nuclear Tension',
         weight: 1.5,
@@ -79,15 +81,14 @@ const THEME_GROUPS = [
     {
         id: 'crisis',
         label: 'General Crisis',
-        geoQuery: 'theme:CRISISLEX_CRISISLEXREC',
-        docQuery: 'theme:CRISISLEX_CRISISLEXREC',
+        geoQuery: 'crisis OR emergency OR martial law OR state of emergency',
+        docQuery: 'crisis OR emergency OR martial law',
         severity: 'elevated',
         category: 'Crisis',
         weight: 1.0,
     },
 ];
 
-// Severity → numeric for scoring
 const SEVERITY_SCORE = { critical: 3, elevated: 2, moderate: 1 };
 
 // ═══════════════════════════════════════════════════════
@@ -95,22 +96,30 @@ const SEVERITY_SCORE = { critical: 3, elevated: 2, moderate: 1 };
 // ═══════════════════════════════════════════════════════
 
 function buildGeoQuery(query) {
-    return `https://api.gdeltproject.org/api/v2/geo/geo?query=${encodeURIComponent(query)}&format=GeoJSON&timespan=1d&maxpoints=75`;
+    // GEO 2.0 API: mode=PointData returns GeoJSON point features
+    // Default timespan is 24h, no need to specify
+    // Docs: https://blog.gdeltproject.org/gdelt-geo-2-0-api-debuts/
+    return `https://api.gdeltproject.org/api/v2/geo/geo?query=${encodeURIComponent(query)}&mode=PointData&format=GeoJSON`;
 }
 
 function buildDocQuery(query, maxRecords = 75) {
+    // DOC 2.0 API: mode=artlist returns article list as JSON
+    // Timespan: number + unit (e.g. "24h", "1440min")
     return `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&timespan=24h&maxrecords=${maxRecords}&format=json&sort=datedesc`;
 }
 
 // ═══════════════════════════════════════════════════════
-// RESPONSE PARSERS (tag events with theme metadata)
+// PARSERS — tag events with theme metadata
 // ═══════════════════════════════════════════════════════
 
 function parseGeoResponse(geojson, themeGroup) {
     if (!geojson?.features) return [];
     return geojson.features
         .filter(f => f.geometry?.coordinates)
-        .filter(f => { const [lng, lat] = f.geometry.coordinates; return !(lat === 0 && lng === 0); })
+        .filter(f => {
+            const [lng, lat] = f.geometry.coordinates;
+            return !(lat === 0 && lng === 0) && !(Math.abs(lat) < 0.01 && Math.abs(lng) < 0.01);
+        })
         .map(f => {
             const [lng, lat] = f.geometry.coordinates;
             const props = f.properties || {};
@@ -122,7 +131,6 @@ function parseGeoResponse(geojson, themeGroup) {
                 source: 'gdelt-geo',
                 tone: props.tone ?? 0,
                 _isGdelt: true,
-                // Theme metadata — this is the key difference from v3
                 _themeId: themeGroup.id,
                 _severity: themeGroup.severity,
                 _category: themeGroup.category,
@@ -197,12 +205,9 @@ function assessConfidence(cluster) {
     const rss = cluster.events.filter(e => !e._isGdelt && !e._isDoc);
     const doc = cluster.events.filter(e => e._isDoc);
     const gdelt = cluster.events.filter(e => e._isGdelt);
-
-    // Source diversity: how many unique domains report on this?
     const domains = new Set(cluster.events.map(e => e.source).filter(Boolean));
-    const diversity = domains.size;
 
-    if ((rss.length >= 3 || doc.length >= 3) && diversity >= 2) return 'high';
+    if ((rss.length >= 3 || doc.length >= 3) && domains.size >= 2) return 'high';
     if (rss.length >= 1 || doc.length >= 1) return 'normal';
     if (gdelt.length >= 8) return 'low';
     return 'noise';
@@ -213,7 +218,7 @@ function sourceDiversity(cluster) {
 }
 
 // ═══════════════════════════════════════════════════════
-// AUTO-NAMING (unchanged from v3)
+// AUTO-NAMING
 // ═══════════════════════════════════════════════════════
 
 function autoNameSituation(cluster) {
@@ -232,69 +237,49 @@ function autoNameSituation(cluster) {
 }
 
 // ═══════════════════════════════════════════════════════
-// CATEGORY FROM THEME METADATA (replaces keyword matching)
+// CATEGORY + SCORE (theme metadata, no keyword scanning)
 // ═══════════════════════════════════════════════════════
 
-/**
- * Determine category by counting which theme group is dominant
- * in the cluster. No keyword scanning — reads from event tags.
- */
 function categorizeSituation(cluster) {
     const themeCounts = {};
-
     for (const ev of cluster.events) {
-        if (ev._category) {
-            themeCounts[ev._category] = (themeCounts[ev._category] || 0) + 1;
-        }
+        if (ev._category) themeCounts[ev._category] = (themeCounts[ev._category] || 0) + 1;
     }
-
     if (Object.keys(themeCounts).length === 0) return 'Geopolitical Tension';
-
-    // Return the most common theme-assigned category
-    return Object.entries(themeCounts)
-        .sort((a, b) => b[1] - a[1])[0][0];
+    return Object.entries(themeCounts).sort((a, b) => b[1] - a[1])[0][0];
 }
-
-// ═══════════════════════════════════════════════════════
-// SCORING (theme-based severity replaces keyword matching)
-// ═══════════════════════════════════════════════════════
 
 function scoreSituation(cluster, confidence) {
     const total = cluster.events.length;
     const richCount = cluster.events.filter(e => !e._isGdelt || e._isDoc).length;
 
-    // 1. Volume score — rich sources weighted higher
+    // Volume
     const effectiveCount = richCount * 1.5 + (total - richCount) * 0.5;
     let volumeScore = Math.min(effectiveCount / 4, 8);
 
-    // 2. Severity from GDELT theme tags (not keywords)
-    //    Take the highest severity across events in the cluster
+    // Severity from theme tags
     let maxSeverity = 0;
     for (const ev of cluster.events) {
-        if (ev._severity) {
-            maxSeverity = Math.max(maxSeverity, SEVERITY_SCORE[ev._severity] || 0);
-        }
+        if (ev._severity) maxSeverity = Math.max(maxSeverity, SEVERITY_SCORE[ev._severity] || 0);
     }
 
-    // 3. Tone score — from GDELT tone or sentiment analysis
+    // Tone
     const tones = cluster.events.filter(e => e.tone).map(e => e.tone);
     let toneScore = 0;
     if (tones.length > 0) {
-        const avgTone = tones.reduce((a, b) => a + b, 0) / tones.length;
-        toneScore = Math.max(0, Math.min(2, (-avgTone) / 5));
+        const avg = tones.reduce((a, b) => a + b, 0) / tones.length;
+        toneScore = Math.max(0, Math.min(2, (-avg) / 5));
     }
 
-    // 4. Source diversity bonus — more sources = more significant
+    // Source diversity bonus
     const diversity = sourceDiversity(cluster);
     const diversityBonus = Math.min(diversity * 0.3, 1.5);
 
-    // 5. Theme weight — some themes carry more weight
+    // Theme weight
     const weights = cluster.events.map(e => e._weight || 1.0);
     const avgWeight = weights.reduce((a, b) => a + b, 0) / weights.length;
 
     let raw = (volumeScore + maxSeverity + toneScore + diversityBonus) * avgWeight;
-
-    // Confidence cap
     if (confidence === 'low') raw = Math.min(raw, 3.9);
 
     return Math.round(Math.min(10, Math.max(1, raw)) * 10) / 10;
@@ -305,18 +290,13 @@ function classifyStatus(score) {
 }
 
 // ═══════════════════════════════════════════════════════
-// DESCRIPTION (TF-IDF summarizer, cleaned up)
+// DESCRIPTION
 // ═══════════════════════════════════════════════════════
 
 function autoDescribeSituation(cluster, confidence) {
     if (confidence === 'low') return generateThinDesc(cluster);
 
-    // Prefer RSS/DOC snippets
-    const snippets = cluster.events
-        .filter(e => !e._isGdelt)
-        .map(e => e.snippet || '')
-        .filter(s => s.length > 30 && !isLocationString(s));
-
+    const snippets = cluster.events.filter(e => !e._isGdelt).map(e => e.snippet || '').filter(s => s.length > 30 && !isLocationString(s));
     if (snippets.length > 0) {
         const corpus = [...new Set(snippets)].join('. ');
         const sents = splitSentences(corpus);
@@ -327,33 +307,18 @@ function autoDescribeSituation(cluster, confidence) {
         if (sents.length === 1) return sents[0];
     }
 
-    // Headlines fallback
-    const headlines = [...new Set(
-        cluster.events.filter(e => !e._isGdelt).map(e => e.title || '').filter(t => t.length > 15 && !isLocationString(t))
-    )];
+    const headlines = [...new Set(cluster.events.filter(e => !e._isGdelt).map(e => e.title || '').filter(t => t.length > 15 && !isLocationString(t)))];
     if (headlines.length > 0) return headlines.slice(0, 3).join(' · ');
 
     return generateThinDesc(cluster);
 }
 
 function generateThinDesc(cluster) {
-    const name = autoNameSituation(cluster);
-    const count = cluster.events.length;
-
-    // Use theme metadata to describe what GDELT detected
+    const name = autoNameSituation(cluster), count = cluster.events.length;
     const themes = {};
-    for (const ev of cluster.events) {
-        if (ev._category) themes[ev._category] = (themes[ev._category] || 0) + 1;
-    }
-
-    const themeDescs = Object.entries(themes)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 2)
-        .map(([cat, n]) => `${cat.toLowerCase()} (${n} events)`);
-
-    if (themeDescs.length > 0) {
-        return `${count} events near ${name}: ${themeDescs.join(', ')}. Classified by GDELT — awaiting headline confirmation.`;
-    }
+    for (const ev of cluster.events) if (ev._category) themes[ev._category] = (themes[ev._category] || 0) + 1;
+    const descs = Object.entries(themes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([cat, n]) => `${cat.toLowerCase()} (${n})`);
+    if (descs.length > 0) return `${count} events near ${name}: ${descs.join(', ')}. Classified by GDELT — awaiting headline confirmation.`;
     return `${count} geo-events detected near ${name}. Monitoring via GDELT data.`;
 }
 
@@ -388,10 +353,7 @@ function extractParties(cluster) {
 }
 
 function extractTopArticles(cluster) {
-    const arts = cluster.events
-        .filter(e => !e._isGdelt)
-        .filter(e => (e.title||'').length > 20 && !isLocationString(e.title||''))
-        .slice(0, 5)
+    const arts = cluster.events.filter(e => !e._isGdelt).filter(e => (e.title||'').length > 20 && !isLocationString(e.title||'')).slice(0, 5)
         .map(e => ({ title: e.title, url: e.url||e.link||'#', source: e.source||'Unknown', tone: e.tone??null }));
     if (arts.length >= 2) return arts;
     return cluster.events.filter(e => (e.title||e.name||'').length > 20).slice(0,5)
@@ -404,37 +366,25 @@ function extractTopArticles(cluster) {
 
 function discoverSituations(events) {
     if (!events?.length) return [];
-
-    // No noise filter needed — GDELT themes are inherently geopolitical.
-    // Sports, entertainment etc. never get tagged with MILITARY, PROTEST, etc.
-    console.log(`[discovery] ${events.length} theme-classified events to cluster`);
+    console.log(`[discovery] ${events.length} theme-tagged events to cluster`);
 
     const clusters = clusterEvents(events).filter(cl => cl.events.length >= 2);
-
     const situations = clusters.map((cl, idx) => {
         const confidence = assessConfidence(cl);
         if (confidence === 'noise') return null;
-
-        const name = autoNameSituation(cl);
-        const score = scoreSituation(cl, confidence);
-
+        const name = autoNameSituation(cl), score = scoreSituation(cl, confidence);
         return {
             id: `auto-${idx}-${Math.round(cl.centerLat)}-${Math.round(cl.centerLng)}`,
             name, lat: cl.centerLat, lng: cl.centerLng,
-            status: classifyStatus(score), score,
-            type: categorizeSituation(cl),
-            description: autoDescribeSituation(cl, confidence),
-            parties: extractParties(cl),
+            status: classifyStatus(score), score, type: categorizeSituation(cl),
+            description: autoDescribeSituation(cl, confidence), parties: extractParties(cl),
             region: findNearest(cl.centerLat, cl.centerLng)?.name || 'Unknown',
-            articleCount: cl.events.length,
-            topArticles: extractTopArticles(cl),
-            confidence,
-            sourceDiversity: sourceDiversity(cl),
+            articleCount: cl.events.length, topArticles: extractTopArticles(cl),
+            confidence, sourceDiversity: sourceDiversity(cl),
             lastChecked: new Date().toISOString(),
         };
     }).filter(Boolean);
 
-    // Dedup by name (keep highest score)
     const dedup = new Map();
     for (const s of situations) if (!dedup.has(s.name) || dedup.get(s.name).score < s.score) dedup.set(s.name, s);
     const final = [...dedup.values()].sort((a, b) => b.score - a.score).slice(0, 30);
@@ -442,25 +392,12 @@ function discoverSituations(events) {
     const c = {high:0, normal:0, low:0};
     final.forEach(s => { c[s.confidence] = (c[s.confidence]||0)+1; });
     console.log(`[discovery] ${final.length} situations — ${c.high} high, ${c.normal} normal, ${c.low} low`);
-
     return final;
 }
 
-// ═══════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════
-
 module.exports = {
-    THEME_GROUPS,
-    buildGeoQuery,
-    buildDocQuery,
-    parseGeoResponse,
-    parseDocResponse,
-    discoverSituations,
-    clusterEvents,
-    haversineKm,
-    classifyStatus,
-    assessConfidence,
-    extractCountries,
-    findNearest,
+    THEME_GROUPS, buildGeoQuery, buildDocQuery,
+    parseGeoResponse, parseDocResponse,
+    discoverSituations, clusterEvents, haversineKm,
+    classifyStatus, assessConfidence, extractCountries, findNearest,
 };

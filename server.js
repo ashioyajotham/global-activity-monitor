@@ -1,7 +1,6 @@
 /**
  * server.js — Global Activity Monitor Backend
- * v4: Theme-based GDELT queries. Each event tagged with severity/category
- *     by the theme group that found it — no keyword classification.
+ * v4.1: Better error logging, fixed GDELT queries, concurrent RSS fetching.
  */
 
 const express = require('express');
@@ -116,10 +115,8 @@ app.get('/api/trends/:name', (req, res) => {
 });
 
 app.get('/api/escalations', (req, res) => {
-    try {
-        const l = Math.min(parseInt(req.query.limit) || 50, 200);
-        res.json({ escalations: db.getEscalationHistory(l) });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    try { res.json({ escalations: db.getEscalationHistory(Math.min(parseInt(req.query.limit) || 50, 200)) }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/stats', (_, res) => {
@@ -127,25 +124,59 @@ app.get('/api/stats', (_, res) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// GDELT FETCHERS (theme-based)
+// GDELT FETCHERS — with diagnostic error logging
 // ═══════════════════════════════════════════════════════
+
+/**
+ * Extract the real error message from Node.js fetch failures.
+ * On Windows, errors nest: TypeError("fetch failed") → cause → cause → actual error
+ */
+function unwrapFetchError(e) {
+    // Walk the cause chain to find the real error
+    let current = e;
+    const parts = [];
+    let depth = 0;
+    while (current && depth < 5) {
+        if (current.code) parts.push(`code=${current.code}`);
+        if (current.message && current.message !== 'fetch failed') parts.push(current.message);
+        if (current.syscall) parts.push(`syscall=${current.syscall}`);
+        if (current.hostname) parts.push(`host=${current.hostname}`);
+        current = current.cause;
+        depth++;
+    }
+    return parts.length > 0 ? parts.join(' | ') : (e.message || 'unknown error');
+}
 
 async function fetchWithTimeout(url, ms = 20000) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
-        const res = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'GlobalActivityMonitor/4.0' } });
+        const res = await fetch(url, {
+            signal: ctrl.signal,
+            headers: { 'User-Agent': 'GlobalActivityMonitor/4.1' },
+        });
         clearTimeout(timer);
         return res;
-    } catch (e) { clearTimeout(timer); throw e; }
+    } catch (e) {
+        clearTimeout(timer);
+        if (e.name === 'AbortError') throw new Error(`timeout after ${ms}ms`);
+        throw new Error(unwrapFetchError(e));
+    }
 }
 
-async function fetchGeoForTheme(themeGroup) {
+async function fetchGeoForTheme(themeGroup, logUrl = false) {
+    const url = buildGeoQuery(themeGroup.geoQuery);
+    if (logUrl) console.log(`[gdelt-geo] Testing URL: ${url}`);
     try {
-        const res = await fetchWithTimeout(buildGeoQuery(themeGroup.geoQuery));
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const res = await fetchWithTimeout(url);
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+        }
         const text = await res.text();
-        if (!text.startsWith('{')) throw new Error('Non-JSON response');
+        if (!text.trim().startsWith('{') && !text.trim().startsWith('[')) {
+            throw new Error(`Non-JSON: "${text.slice(0, 120)}..."`);
+        }
         const events = parseGeoResponse(JSON.parse(text), themeGroup);
         console.log(`[gdelt-geo] ${themeGroup.id}: ${events.length} events`);
         return events;
@@ -155,10 +186,15 @@ async function fetchGeoForTheme(themeGroup) {
     }
 }
 
-async function fetchDocForTheme(themeGroup) {
+async function fetchDocForTheme(themeGroup, logUrl = false) {
+    const url = buildDocQuery(themeGroup.docQuery);
+    if (logUrl) console.log(`[gdelt-doc] Testing URL: ${url}`);
     try {
-        const res = await fetchWithTimeout(buildDocQuery(themeGroup.docQuery));
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const res = await fetchWithTimeout(url);
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+        }
         const data = await res.json();
         const articles = parseDocResponse(data, themeGroup);
         console.log(`[gdelt-doc] ${themeGroup.id}: ${articles.length} geolocated`);
@@ -171,46 +207,56 @@ async function fetchDocForTheme(themeGroup) {
 
 /**
  * Fetch events across all theme groups.
- * Each event inherits severity + category from its theme group.
+ * Sequential with delays to respect GDELT rate limits.
  *
- * Rate budget: ~14 calls per cycle
- *   7 GEO queries (one per theme group)
- *   + up to 5 DOC queries (top severity themes)
- *   Interleaved with 2s delays = ~30s total
+ * Rate budget: ~12 calls per cycle
+ *   7 GEO queries + up to 5 DOC queries
+ *   2s delay between each = ~24s total when all succeed
  */
 async function fetchAllGeoEvents() {
-    console.log('[gdelt] Scanning via theme groups (GEO + DOC)...');
+    console.log(`[gdelt] Scanning ${THEME_GROUPS.length} theme groups (GEO + DOC)...`);
     const start = Date.now();
     const allEvents = [];
+    let geoOk = 0, geoFail = 0, docOk = 0, docFail = 0;
 
-    // Sort theme groups by weight (fetch highest-severity themes first)
+    // Sort by weight (highest severity first)
     const sorted = [...THEME_GROUPS].sort((a, b) => b.weight - a.weight);
 
     for (let i = 0; i < sorted.length; i++) {
         const tg = sorted[i];
+        const isFirst = (i === 0);
 
         // GEO query for every theme group
-        const geoEvents = await fetchGeoForTheme(tg);
+        const geoEvents = await fetchGeoForTheme(tg, isFirst);
+        if (geoEvents.length > 0) geoOk++; else geoFail++;
         allEvents.push(...geoEvents);
+
+        // Small delay between calls
         await delay(2000);
 
-        // DOC query for top 5 (rate budget)
+        // DOC query for top 5 themes (rate budget)
         if (i < 5) {
-            const docEvents = await fetchDocForTheme(tg);
+            const docEvents = await fetchDocForTheme(tg, isFirst);
+            if (docEvents.length > 0) docOk++; else docFail++;
             allEvents.push(...docEvents);
             await delay(2000);
         }
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`[gdelt] Total: ${allEvents.length} theme-tagged events in ${elapsed}s`);
+    console.log(`[gdelt] Done in ${elapsed}s: ${allEvents.length} events (GEO: ${geoOk}ok/${geoFail}fail, DOC: ${docOk}ok/${docFail}fail)`);
+
+    if (allEvents.length === 0 && geoFail === sorted.length) {
+        console.error('[gdelt] ⚠ ALL queries failed — check network or GDELT API status');
+    }
+
     return allEvents;
 }
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ═══════════════════════════════════════════════════════
-// NEWS → EVENTS (RSS articles get theme metadata from content matching)
+// NEWS → EVENTS
 // ═══════════════════════════════════════════════════════
 
 function newsToEvents(newsItems) {
@@ -222,12 +268,7 @@ function newsToEvents(newsItems) {
                 lat: loc.lat, lng: loc.lng,
                 title: item.title, url: item.link, source: item.source,
                 snippet: item.snippet || '', tone: item.tone || 0,
-                // RSS articles don't have theme tags — they get
-                // 'normal' confidence and contribute to description quality
-                _isGdelt: false,
-                _severity: null,
-                _category: null,
-                _weight: 1.0,
+                _isGdelt: false, _severity: null, _category: null, _weight: 1.0,
             });
         }
     }
@@ -245,8 +286,12 @@ async function runDiscovery() {
         console.log(`[discovery] GDELT: ${geoEvents.length}, RSS: ${newsEvents.length}`);
 
         const all = [...geoEvents, ...newsEvents];
-        console.log(`[discovery] Total to cluster: ${all.length}`);
+        if (all.length === 0) {
+            console.log('[discovery] No events available — skipping cycle');
+            return cachedActivities;
+        }
 
+        console.log(`[discovery] Total to cluster: ${all.length}`);
         const situations = discoverSituations(all);
         console.log(`[discovery] Result: ${situations.length} situations`);
 
@@ -259,9 +304,7 @@ async function runDiscovery() {
 
             try {
                 db.storeSituations(situations);
-                for (const s of situations) {
-                    if (s.topArticles?.length) db.storeArticles(s.topArticles, s.name);
-                }
+                for (const s of situations) if (s.topArticles?.length) db.storeArticles(s.topArticles, s.name);
                 console.log(`[db] Cycle #${discoveryCount}: ${situations.length} stored`);
             } catch (e) { console.error('[db]', e.message); }
 
@@ -325,11 +368,12 @@ async function start() {
 
     server.listen(PORT, () => {
         console.log('═══════════════════════════════════════════');
-        console.log('  GLOBAL ACTIVITY MONITOR v4');
+        console.log('  GLOBAL ACTIVITY MONITOR v4.2');
         console.log('═══════════════════════════════════════════');
         console.log(`  http://localhost:${PORT}`);
         console.log(`  Auth: ${AUTH_PASSWORD ? 'ON' : 'OFF'}`);
         console.log(`  Theme groups: ${THEME_GROUPS.length}`);
+        console.log(`  RSS feeds: ${require('./feeds').FEEDS.length}`);
         console.log(`  DB snapshots: ${db.getSnapshotCount()}`);
         console.log('═══════════════════════════════════════════');
     });
@@ -340,8 +384,52 @@ async function start() {
     cron.schedule('0 3 * * *', () => db.cleanup(30));
 
     // Initial fetch
+    console.log('[startup] Fetching RSS feeds...');
     await refreshNews();
+    // Diagnostic: test GDELT connectivity before first discovery cycle
+    console.log('[startup] Testing GDELT API connectivity...');
+    await testGdeltConnectivity();
+
+    console.log('[startup] Running GDELT discovery...');
     await runDiscovery();
+    console.log('[startup] Ready');
+}
+
+/**
+ * Startup diagnostic: test a simple known-working GDELT query.
+ * This helps isolate network vs. query format issues.
+ */
+async function testGdeltConnectivity() {
+    const testUrls = [
+        {
+            name: 'GEO simple',
+            url: 'https://api.gdeltproject.org/api/v2/geo/geo?query=conflict&mode=PointData&format=GeoJSON',
+        },
+        {
+            name: 'DOC simple',
+            url: 'https://api.gdeltproject.org/api/v2/doc/doc?query=conflict&mode=artlist&maxrecords=5&format=json&sort=datedesc',
+        },
+    ];
+
+    for (const test of testUrls) {
+        try {
+            console.log(`[diag] ${test.name}: ${test.url}`);
+            const res = await fetchWithTimeout(test.url, 25000);
+            const body = await res.text();
+            console.log(`[diag] ${test.name}: HTTP ${res.status}, ${body.length} bytes, starts with: "${body.slice(0, 80)}"`);
+        } catch (e) {
+            console.error(`[diag] ${test.name} FAILED: ${e.message}`);
+            // Extra: try with http instead of https to test if it's a TLS issue
+            try {
+                const httpUrl = test.url.replace('https://', 'http://');
+                console.log(`[diag] Retrying with HTTP: ${httpUrl}`);
+                const res2 = await fetchWithTimeout(httpUrl, 15000);
+                console.log(`[diag] HTTP fallback: status ${res2.status}`);
+            } catch (e2) {
+                console.error(`[diag] HTTP fallback also failed: ${e2.message}`);
+            }
+        }
+    }
 }
 
 process.on('SIGINT', () => { console.log('\n[shutdown] Closing...'); db.close(); process.exit(0); });

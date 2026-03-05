@@ -1,49 +1,53 @@
 /**
  * feeds.js — RSS News Feed Parser
  *
- * v4: Simplified sentiment. Custom geopolitical lexicon removed —
- *     GDELT's theme-based classification handles severity/category.
- *     RSS sentiment is now supplementary signal only (tone shading).
+ * v4.1: Replaced dead feeds (Reuters DNS dead, RSSHub 403).
+ *       Added resilient feed handling with per-feed timeout.
  */
 
 const RSSParser = require('rss-parser');
 const Sentiment = require('sentiment');
 
-const parser = new RSSParser({ timeout: 10000 });
+const parser = new RSSParser({
+    timeout: 15000,
+    headers: {
+        'User-Agent': 'GlobalActivityMonitor/4.1 (RSS Reader)',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+    },
+});
 const sentiment = new Sentiment();
 
 // ═══════════════════════════════════════════════════════
-// FEED SOURCES
+// FEED SOURCES — verified working as of 2025
 // ═══════════════════════════════════════════════════════
 
 const FEEDS = [
-    { name: 'BBC', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
+    // Major wire services / broadcasters
+    { name: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
     { name: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
-    { name: 'Reuters', url: 'https://feeds.reuters.com/reuters/worldNews' },
-    { name: 'AP News', url: 'https://rsshub.app/apnews/topics/world-news' },
+    { name: 'France 24', url: 'https://www.france24.com/en/rss' },
+    { name: 'DW News', url: 'https://rss.dw.com/rdf/rss-en-all' },
+
+    // Independent / investigative
+    { name: 'The Intercept', url: 'https://theintercept.com/feed/?rss' },
     { name: 'Counterpunch', url: 'https://www.counterpunch.org/feed/' },
     { name: 'Declassified UK', url: 'https://declassifieduk.org/feed/' },
-    { name: 'RT News', url: 'https://www.rt.com/rss/news/' },
-    { name: 'Mint Press News', url: 'https://www.mintpressnews.com/feed/' },
     { name: 'The Grayzone', url: 'https://thegrayzone.com/feed/' },
+    { name: 'Mint Press', url: 'https://www.mintpressnews.com/feed/' },
+
+    // Regional / non-Western
+    { name: 'CGTN', url: 'https://www.cgtn.com/subscribe/rss/section/world.xml' },
+    { name: 'Middle East Eye', url: 'https://www.middleeasteye.net/rss' },
+    { name: 'RT World', url: 'https://www.rt.com/rss/news/' },
 ];
 
 // ═══════════════════════════════════════════════════════
-// SENTIMENT (base AFINN only — no custom overrides)
+// SENTIMENT
 // ═══════════════════════════════════════════════════════
 
-/**
- * Simple tone analysis for RSS headlines.
- * Maps AFINN score to GDELT-compatible -10 to +10 scale.
- *
- * This is a supplementary signal — GDELT theme metadata
- * handles the heavy lifting for classification and severity.
- */
 function analyzeTone(text) {
     const result = sentiment.analyze(text);
-    // Scale AFINN score (-inf to +inf) into -10 to +10 range
-    const tone = Math.max(-10, Math.min(10, result.score * 2));
-    return Math.round(tone * 10) / 10;
+    return Math.round(Math.max(-10, Math.min(10, result.score * 2)) * 10) / 10;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -52,8 +56,10 @@ function analyzeTone(text) {
 
 async function fetchAllNews() {
     const allItems = [];
+    const results = { success: 0, failed: 0, errors: [] };
 
-    for (const feed of FEEDS) {
+    // Fetch all feeds concurrently with individual timeouts
+    const feedPromises = FEEDS.map(async (feed) => {
         try {
             const parsed = await parser.parseURL(feed.url);
             const items = (parsed.items || []).map(item => {
@@ -67,10 +73,30 @@ async function fetchAllNews() {
                     tone: analyzeTone(title),
                 };
             });
-            allItems.push(...items);
+            results.success++;
+            return items;
         } catch (err) {
-            console.error(`[feeds] Error fetching ${feed.name}:`, err.message);
+            results.failed++;
+            const reason = err.code === 'ENOTFOUND' ? 'DNS failed'
+                : err.message?.includes('Status code') ? err.message
+                : err.code === 'ECONNABORTED' || err.message?.includes('timeout') ? 'timeout'
+                : err.message?.slice(0, 60) || 'unknown error';
+            results.errors.push(`${feed.name}: ${reason}`);
+            return [];
         }
+    });
+
+    const feedResults = await Promise.allSettled(feedPromises);
+    for (const result of feedResults) {
+        if (result.status === 'fulfilled') allItems.push(...result.value);
+    }
+
+    // Log feed health
+    if (results.errors.length > 0) {
+        console.log(`[feeds] ${results.success}/${FEEDS.length} feeds OK, ${results.failed} failed:`);
+        results.errors.forEach(e => console.log(`  ⚠ ${e}`));
+    } else {
+        console.log(`[feeds] All ${FEEDS.length} feeds fetched OK`);
     }
 
     const deduped = deduplicateByTitle(allItems);

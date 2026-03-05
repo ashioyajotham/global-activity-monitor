@@ -1,6 +1,6 @@
 {
   "name": "global-activity-monitor",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "Autonomous world activity tracker — GDELT theme-classified events, Natural Earth map, SQLite persistence",
   "main": "server.js",
   "scripts": {
