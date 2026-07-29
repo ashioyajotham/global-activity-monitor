@@ -36,6 +36,7 @@ const {
     THEME_GROUPS, buildGeoQuery, buildDocQuery,
     parseGeoResponse, parseDocResponse,
     extractCountries, discoverSituations,
+    isNoiseHeadline, categorizeText,
 } = require('./discovery');
 const db = require('./db');
 const { geocodePlace, isEnabled: geocodingEnabled } = require('./geocoding');
@@ -315,18 +316,44 @@ async function resolveEventCoords(loc) {
 
 async function newsToEvents(newsItems) {
     const events = [];
+    let noiseFiltered = 0, nonGeoFiltered = 0;
+
     for (const item of newsItems) {
-        const countries = extractCountries(`${item.title} ${item.snippet || ''}`);
+        const text = `${item.title} ${item.snippet || ''}`;
+
+        // Tier 1: Sports, Entertainment, Lifestyle Noise Filter
+        if (isNoiseHeadline(text)) {
+            noiseFiltered++;
+            continue;
+        }
+
+        // Tier 2: Geopolitical Category Matching
+        const category = categorizeText(text);
+
+        // Tier 3: Skip generic non-geopolitical items (unless tone is strongly negative < -2.0)
+        if (!category && (item.tone ?? 0) > -2.0) {
+            nonGeoFiltered++;
+            continue;
+        }
+
+        const countries = extractCountries(text);
         for (const loc of countries) {
             const coords = await resolveEventCoords(loc);
+            const isCriticalCat = category === 'Armed Conflict' || category === 'Military Operations' || category === 'Terrorism';
             events.push({
                 lat: coords.lat, lng: coords.lng,
                 title: item.title, url: item.link, source: item.source,
                 snippet: item.snippet || '', tone: item.tone || 0,
-                _isGdelt: false, _severity: null, _category: null, _weight: 1.0,
+                _isGdelt: false,
+                _severity: category ? (isCriticalCat ? 'critical' : 'elevated') : 'moderate',
+                _category: category || 'General News',
+                _weight: category ? 1.2 : 0.8,
                 _geocoded: coords._geocoded,
             });
         }
+    }
+    if (noiseFiltered > 0 || nonGeoFiltered > 0) {
+        console.log(`[news-filter] Filtered ${noiseFiltered} sports/entertainment noise, ${nonGeoFiltered} non-geopolitical articles`);
     }
     return events;
 }

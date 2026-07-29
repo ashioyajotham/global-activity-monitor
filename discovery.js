@@ -159,6 +159,78 @@ function parseDocResponse(data, themeGroup) {
 }
 
 // ═══════════════════════════════════════════════════════
+// NOISE & RELEVANCE FILTERING
+// ═══════════════════════════════════════════════════════
+
+const NOISE_TERMS = [
+    // Sports & Tournaments
+    'world cup', 'champions league', 'premier league', 'la liga', 'serie a', 'bundesliga',
+    'super bowl', 'nfl', 'nba', 'nhl', 'mlb', 'pga tour', 'grand slam', 'wimbledon',
+    'olympics', 'olympic', 'paralympics', 'world series', 'formula 1', 'f1', 'motogp',
+    'football', 'soccer', 'basketball', 'baseball', 'cricket', 'rugby', 'hockey', 'golf', 'tennis',
+    'match', 'final', 'semi-final', 'quarter-final', 'tournament', 'championship', 'playoffs',
+    'goal', 'goals', 'scored', 'penalty', 'red card', 'yellow card', 'hat-trick', 'clean sheet',
+    'manager', 'head coach', 'transfer fee', 'signing', 'contract extension',
+    // Entertainment / Culture / Lifestyle / Astronomy
+    'box office', 'red carpet', 'fashion week', 'grammy', 'grammys', 'oscar', 'oscars',
+    'emmy', 'emmys', 'bafta', 'golden globe', 'box office record', 'album release',
+    'movie review', 'film review', 'album review', 'celebrity', 'horoscope',
+    'solar eclipse', 'lunar eclipse', 'meteor shower', 'stargazing',
+    'video game', 'esports', 'fortnite', 'playstation', 'xbox',
+];
+
+const GEOPOLITICAL_SIGNALS = [
+    'war', 'conflict', 'killed', 'airstrike', 'shelling', 'bombing', 'battle', 'casualty',
+    'combat', 'artillery', 'gunfire', 'infantry', 'military', 'army', 'navy', 'air force',
+    'troops', 'missile', 'drone', 'deploy', 'defense', 'terror', 'terrorist', 'extremist',
+    'insurgent', 'hostage', 'protest', 'riot', 'uprising', 'coup', 'revolution', 'refugee',
+    'humanitarian', 'famine', 'sanctions', 'ceasefire', 'treaty', 'ambassador', 'emergency',
+    'disaster', 'wildfire', 'earthquake', 'tsunami', 'evacuation', 'nuclear'
+];
+
+function isNoiseHeadline(text) {
+    if (!text) return false;
+    const lower = text.toLowerCase();
+
+    const matchesNoise = NOISE_TERMS.some(term => {
+        const regex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        return regex.test(lower);
+    });
+
+    if (!matchesNoise) return false;
+
+    // Exception for strong geopolitical signals (e.g. "Olympic boycott")
+    const geoMatches = GEOPOLITICAL_SIGNALS.filter(sig => {
+        const regex = new RegExp(`\\b${sig}\\b`, 'i');
+        return regex.test(lower);
+    });
+
+    return geoMatches.length < 2;
+}
+
+const GEOPOLITICAL_CATEGORY_MAP = {
+    'Armed Conflict': ['war', 'conflict', 'killed', 'airstrike', 'shelling', 'bombing', 'battle', 'casualty', 'combat', 'artillery', 'gunfire'],
+    'Military Operations': ['military', 'army', 'navy', 'air force', 'troops', 'missile', 'drone', 'deploy', 'deployment', 'defense', 'base'],
+    'Terrorism': ['terror', 'terrorist', 'extremist', 'insurgent', 'hostage', 'explosion', 'suicide bomb', 'ambush'],
+    'Civil Unrest': ['protest', 'protesters', 'riot', 'riots', 'uprising', 'coup', 'revolution', 'demonstration', 'rallies', 'strike'],
+    'Humanitarian Crisis': ['refugee', 'humanitarian', 'famine', 'displacement', 'displaced', 'starvation', 'aid delivery'],
+    'Diplomacy': ['summit', 'treaty', 'sanctions', 'embargo', 'envoy', 'ambassador', 'ceasefire', 'peace talks', 'diplomatic'],
+    'Crisis': ['emergency', 'disaster', 'wildfire', 'earthquake', 'tsunami', 'evacuation', 'state of emergency', 'flood'],
+};
+
+function categorizeText(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    for (const [cat, keywords] of Object.entries(GEOPOLITICAL_CATEGORY_MAP)) {
+        for (const kw of keywords) {
+            const regex = new RegExp(`\\b${kw}\\b`, 'i');
+            if (regex.test(lower)) return cat;
+        }
+    }
+    return null;
+}
+
+// ═══════════════════════════════════════════════════════
 // UTILITIES
 // ═══════════════════════════════════════════════════════
 
@@ -237,7 +309,7 @@ function autoNameSituation(cluster) {
 }
 
 // ═══════════════════════════════════════════════════════
-// CATEGORY + SCORE (theme metadata, no keyword scanning)
+// CATEGORY + SCORE
 // ═══════════════════════════════════════════════════════
 
 function categorizeSituation(cluster) {
@@ -245,7 +317,7 @@ function categorizeSituation(cluster) {
     for (const ev of cluster.events) {
         if (ev._category) themeCounts[ev._category] = (themeCounts[ev._category] || 0) + 1;
     }
-    if (Object.keys(themeCounts).length === 0) return 'Geopolitical Tension';
+    if (Object.keys(themeCounts).length === 0) return 'General Activity';
     return Object.entries(themeCounts).sort((a, b) => b[1] - a[1])[0][0];
 }
 
@@ -296,7 +368,11 @@ function classifyStatus(score) {
 function autoDescribeSituation(cluster, confidence) {
     if (confidence === 'low') return generateThinDesc(cluster);
 
-    const snippets = cluster.events.filter(e => !e._isGdelt).map(e => e.snippet || '').filter(s => s.length > 30 && !isLocationString(s));
+    const snippets = cluster.events
+        .filter(e => !e._isGdelt)
+        .map(e => e.snippet || '')
+        .filter(s => s.length > 30 && !isLocationString(s) && !isNoiseHeadline(s));
+
     if (snippets.length > 0) {
         const corpus = [...new Set(snippets)].join('. ');
         const sents = splitSentences(corpus);
@@ -307,7 +383,11 @@ function autoDescribeSituation(cluster, confidence) {
         if (sents.length === 1) return sents[0];
     }
 
-    const headlines = [...new Set(cluster.events.filter(e => !e._isGdelt).map(e => e.title || '').filter(t => t.length > 15 && !isLocationString(t)))];
+    const headlines = [...new Set(cluster.events
+        .filter(e => !e._isGdelt)
+        .map(e => e.title || '')
+        .filter(t => t.length > 15 && !isLocationString(t) && !isNoiseHeadline(t)))];
+    
     if (headlines.length > 0) return headlines.slice(0, 3).join(' · ');
 
     return generateThinDesc(cluster);
@@ -323,7 +403,12 @@ function generateThinDesc(cluster) {
 }
 
 // TF-IDF helpers
-function splitSentences(t) { return t.replace(/\s+/g,' ').split(/(?<=[.!?])\s+/).map(s=>s.trim()).filter(s=>s.length>30&&/[a-zA-Z]/.test(s)&&!isLocationString(s)); }
+function splitSentences(t) { 
+    return t.replace(/\s+/g,' ')
+        .split(/(?<=[.!?])\s+/)
+        .map(s=>s.trim())
+        .filter(s=>s.length>30 && /[a-zA-Z]/.test(s) && !isLocationString(s) && !isNoiseHeadline(s)); 
+}
 
 function scoreSentences(sents) {
     const STOP = new Set('the a an is are was were be been being have has had do does did will would could should may might shall can to of in for on with at by from as into through during before after above below between out off over under again further then once here there when where why how all both each few more most other some such no nor not only own same so than too very and but if or because until while that this it its he she they them their his her we you i my your said says also new one two three just about up'.split(' '));
@@ -353,10 +438,10 @@ function extractParties(cluster) {
 }
 
 function extractTopArticles(cluster) {
-    const arts = cluster.events.filter(e => !e._isGdelt).filter(e => (e.title||'').length > 20 && !isLocationString(e.title||'')).slice(0, 5)
+    const arts = cluster.events.filter(e => !e._isGdelt).filter(e => (e.title||'').length > 20 && !isLocationString(e.title||'') && !isNoiseHeadline(e.title||'')).slice(0, 5)
         .map(e => ({ title: e.title, url: e.url||e.link||'#', source: e.source||'Unknown', tone: e.tone??null }));
     if (arts.length >= 2) return arts;
-    return cluster.events.filter(e => (e.title||e.name||'').length > 20).slice(0,5)
+    return cluster.events.filter(e => (e.title||e.name||'').length > 20 && !isNoiseHeadline(e.title||e.name||'')).slice(0,5)
         .map(e => ({ title: e.title||e.name, url: e.url||'#', source: e.source||'Unknown', tone: e.tone??null }));
 }
 
@@ -400,4 +485,5 @@ module.exports = {
     parseGeoResponse, parseDocResponse,
     discoverSituations, clusterEvents, haversineKm,
     classifyStatus, assessConfidence, extractCountries, findNearest,
+    isNoiseHeadline, categorizeText,
 };
