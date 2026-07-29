@@ -3,11 +3,32 @@
  * v4.1: Better error logging, fixed GDELT queries, concurrent RSS fetching.
  */
 
+const fs = require('fs');
+const path = require('path');
+
+// Load .env variables into process.env if .env file exists
+try {
+    const envPath = path.join(__dirname, '.env');
+    if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        for (const line of envContent.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+                const eqIdx = trimmed.indexOf('=');
+                if (eqIdx > 0) {
+                    const key = trimmed.slice(0, eqIdx).trim();
+                    const val = trimmed.slice(eqIdx + 1).trim();
+                    if (!process.env[key]) process.env[key] = val;
+                }
+            }
+        }
+    }
+} catch (e) { console.error('[env] Error loading .env:', e.message); }
+
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const cron = require('node-cron');
 const cors = require('cors');
-const path = require('path');
 const http = require('http');
 
 const { fetchAllNews } = require('./feeds');
@@ -151,7 +172,7 @@ function unwrapFetchError(e) {
     return parts.length > 0 ? parts.join(' | ') : (e.message || 'unknown error');
 }
 
-async function fetchWithTimeout(url, ms = 20000) {
+async function fetchWithTimeout(url, ms = 25000) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
@@ -168,11 +189,16 @@ async function fetchWithTimeout(url, ms = 20000) {
     }
 }
 
-async function fetchGeoForTheme(themeGroup, logUrl = false) {
+async function fetchGeoForTheme(themeGroup, logUrl = false, attempt = 1) {
     const url = buildGeoQuery(themeGroup.geoQuery);
     if (logUrl) console.log(`[gdelt-geo] Testing URL: ${url}`);
     try {
         const res = await fetchWithTimeout(url);
+        if (res.status === 429 && attempt <= 2) {
+            console.warn(`[gdelt-geo] ${themeGroup.id}: Rate limited (HTTP 429), retrying in 6s (attempt ${attempt}/2)...`);
+            await delay(6000);
+            return fetchGeoForTheme(themeGroup, false, attempt + 1);
+        }
         if (!res.ok) {
             const body = await res.text().catch(() => '');
             throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
@@ -190,11 +216,16 @@ async function fetchGeoForTheme(themeGroup, logUrl = false) {
     }
 }
 
-async function fetchDocForTheme(themeGroup, logUrl = false) {
+async function fetchDocForTheme(themeGroup, logUrl = false, attempt = 1) {
     const url = buildDocQuery(themeGroup.docQuery);
     if (logUrl) console.log(`[gdelt-doc] Testing URL: ${url}`);
     try {
         const res = await fetchWithTimeout(url);
+        if (res.status === 429 && attempt <= 2) {
+            console.warn(`[gdelt-doc] ${themeGroup.id}: Rate limited (HTTP 429), retrying in 6s (attempt ${attempt}/2)...`);
+            await delay(6000);
+            return fetchDocForTheme(themeGroup, false, attempt + 1);
+        }
         if (!res.ok) {
             const body = await res.text().catch(() => '');
             throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
@@ -211,11 +242,11 @@ async function fetchDocForTheme(themeGroup, logUrl = false) {
 
 /**
  * Fetch events across all theme groups.
- * Sequential with delays to respect GDELT rate limits.
+ * Sequential with 5.5s delays to strictly respect GDELT rate limits (max 1 req / 5s).
  *
  * Rate budget: ~12 calls per cycle
  *   7 GEO queries + up to 5 DOC queries
- *   2s delay between each = ~24s total when all succeed
+ *   5.5s delay between each = ~66s total when all succeed
  */
 async function fetchAllGeoEvents() {
     console.log(`[gdelt] Scanning ${THEME_GROUPS.length} theme groups (GEO + DOC)...`);
@@ -235,15 +266,15 @@ async function fetchAllGeoEvents() {
         if (geoEvents.length > 0) geoOk++; else geoFail++;
         allEvents.push(...geoEvents);
 
-        // Small delay between calls
-        await delay(2000);
+        // Respect GDELT 5-second rate limit between calls
+        await delay(5500);
 
         // DOC query for top 5 themes (rate budget)
         if (i < 5) {
             const docEvents = await fetchDocForTheme(tg, isFirst);
             if (docEvents.length > 0) docOk++; else docFail++;
             allEvents.push(...docEvents);
-            await delay(2000);
+            await delay(5500);
         }
     }
 
@@ -436,7 +467,9 @@ async function testGdeltConnectivity() {
         },
     ];
 
-    for (const test of testUrls) {
+    for (let i = 0; i < testUrls.length; i++) {
+        const test = testUrls[i];
+        if (i > 0) await delay(5500);
         try {
             console.log(`[diag] ${test.name}: ${test.url}`);
             const res = await fetchWithTimeout(test.url, 25000);
@@ -444,15 +477,6 @@ async function testGdeltConnectivity() {
             console.log(`[diag] ${test.name}: HTTP ${res.status}, ${body.length} bytes, starts with: "${body.slice(0, 80)}"`);
         } catch (e) {
             console.error(`[diag] ${test.name} FAILED: ${e.message}`);
-            // Extra: try with http instead of https to test if it's a TLS issue
-            try {
-                const httpUrl = test.url.replace('https://', 'http://');
-                console.log(`[diag] Retrying with HTTP: ${httpUrl}`);
-                const res2 = await fetchWithTimeout(httpUrl, 15000);
-                console.log(`[diag] HTTP fallback: status ${res2.status}`);
-            } catch (e2) {
-                console.error(`[diag] HTTP fallback also failed: ${e2.message}`);
-            }
         }
     }
 }
