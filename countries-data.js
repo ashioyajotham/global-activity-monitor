@@ -212,46 +212,61 @@ const COUNTRIES = [
 const _nameIndex = new Map();
 const _coordIndex = []; // for nearest-country lookup
 
+// Specificity tiers — used to decide which matched term is worth sending
+// to the Geocoding API. A bare country/abbrev/code match has nothing more
+// precise to offer than the centroid we already have; a capital, city, or
+// named sub-region match is worth geocoding for real precision.
+const SPECIFICITY = { COUNTRY: 1, CAPITAL: 2, CITY: 3, REGION: 3 };
+
+function _index(term, country, specificity, originalTerm) {
+    // Don't let a lower-specificity alias clobber a higher-specificity one
+    // already indexed for the same term text (shouldn't normally collide,
+    // but keeps behavior predictable if data ever overlaps).
+    const existing = _nameIndex.get(term);
+    if (existing && existing.specificity > specificity) return;
+    _nameIndex.set(term, { country, specificity, matchedTerm: originalTerm });
+}
+
 function _buildIndex() {
     for (const country of COUNTRIES) {
         // Index by exact country name (case-insensitive)
-        _nameIndex.set(country.name.toLowerCase(), country);
+        _index(country.name.toLowerCase(), country, SPECIFICITY.COUNTRY, country.name);
 
         // Index by official abbreviations
         if (country.abbrevs) {
             for (const abbrev of country.abbrevs) {
-                _nameIndex.set(abbrev.toLowerCase(), country);
+                _index(abbrev.toLowerCase(), country, SPECIFICITY.COUNTRY, country.name);
             }
         }
 
         // Index by alt names (e.g. Burma → Myanmar)
         if (country.altNames) {
             for (const alt of country.altNames) {
-                _nameIndex.set(alt.toLowerCase(), country);
+                _index(alt.toLowerCase(), country, SPECIFICITY.COUNTRY, country.name);
             }
         }
 
         // Index by capital city
         if (country.capital) {
-            _nameIndex.set(country.capital.toLowerCase(), country);
+            _index(country.capital.toLowerCase(), country, SPECIFICITY.CAPITAL, country.capital);
         }
 
         // Index by major cities
         if (country.cities) {
             for (const city of country.cities) {
-                _nameIndex.set(city.toLowerCase(), country);
+                _index(city.toLowerCase(), country, SPECIFICITY.CITY, city);
             }
         }
 
         // Index by sub-regions (Darfur, Crimea, etc.)
         if (country.regions) {
             for (const region of country.regions) {
-                _nameIndex.set(region.toLowerCase(), country);
+                _index(region.toLowerCase(), country, SPECIFICITY.REGION, region);
             }
         }
 
         // Index by ISO code
-        _nameIndex.set(country.code.toLowerCase(), country);
+        _index(country.code.toLowerCase(), country, SPECIFICITY.COUNTRY, country.name);
 
         // Coordinate index
         _coordIndex.push(country);
@@ -272,17 +287,27 @@ _buildIndex();
 function extractCountries(text) {
     if (!text) return [];
     const lower = text.toLowerCase();
-    const found = new Map(); // name → country (dedup)
+    const found = new Map(); // country name → { ...country, matchedTerm, specificity }
 
-    for (const [term, country] of _nameIndex) {
+    for (const [term, entry] of _nameIndex) {
         // Skip very short terms that cause false positives (2-letter codes)
         if (term.length <= 2) continue;
 
         // Whole-word boundary match
         const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const regex = new RegExp(`\\b${escaped}\\b`, 'i');
-        if (regex.test(lower) && !found.has(country.name)) {
-            found.set(country.name, country);
+        if (!regex.test(lower)) continue;
+
+        const existing = found.get(entry.country.name);
+        // Keep the MOST SPECIFIC match per country (a city/region mention
+        // is worth more than a bare country-name mention in the same
+        // headline — it's what geocoding.js should actually look up).
+        if (!existing || entry.specificity > existing.specificity) {
+            found.set(entry.country.name, {
+                ...entry.country,
+                matchedTerm: entry.matchedTerm,
+                specificity: entry.specificity,
+            });
         }
     }
 
@@ -318,7 +343,8 @@ function findNearest(lat, lng) {
  * Look up a country by any known identifier (name, code, capital, abbreviation).
  */
 function lookupCountry(identifier) {
-    return _nameIndex.get(identifier.toLowerCase()) || null;
+    const entry = _nameIndex.get(identifier.toLowerCase());
+    return entry ? entry.country : null;
 }
 
 /**
@@ -338,6 +364,7 @@ function getIsoNumericNames() {
 module.exports = {
     COUNTRIES,
     ISO_NUMERIC_NAMES,
+    SPECIFICITY,
     extractCountries,
     findNearest,
     lookupCountry,

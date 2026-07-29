@@ -17,6 +17,7 @@ const {
     extractCountries, discoverSituations,
 } = require('./discovery');
 const db = require('./db');
+const { geocodePlace, isEnabled: geocodingEnabled } = require('./geocoding');
 
 const PORT = process.env.PORT || 4000;
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || null;
@@ -89,7 +90,10 @@ app.get('/api/news', (_, res) => res.json({ news: cachedNews, lastFetch: lastNew
 app.get('/api/health', (_, res) => {
     let s = {};
     try { s = db.getStats(); } catch (e) { s = { error: e.message }; }
-    res.json({ status: 'ok', uptime: process.uptime(), activities: cachedActivities.length, db: s });
+    res.json({
+        status: 'ok', uptime: process.uptime(), activities: cachedActivities.length, db: s,
+        geocoding: require('./geocoding').getStatus(),
+    });
 });
 
 app.get('/api/trends', (req, res) => {
@@ -259,16 +263,37 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 // NEWS → EVENTS
 // ═══════════════════════════════════════════════════════
 
-function newsToEvents(newsItems) {
+/**
+ * Resolve a matched location to coordinates. Uses the Geocoding API for
+ * anything more specific than a bare country mention (capital, city, named
+ * region) so events land on the real place instead of the country
+ * centroid. Falls back to the centroid whenever geocoding isn't available
+ * or doesn't return a result — this never throws and never blocks on a
+ * missing API key.
+ */
+async function resolveEventCoords(loc) {
+    // SPECIFICITY.COUNTRY (1) means only the bare country/abbrev/code
+    // matched — there's no more precise term to geocode, the centroid
+    // IS the best we can do.
+    if (geocodingEnabled() && loc.specificity > 1) {
+        const geocoded = await geocodePlace(loc.matchedTerm, loc.name);
+        if (geocoded) return { lat: geocoded.lat, lng: geocoded.lng, _geocoded: true };
+    }
+    return { lat: loc.lat, lng: loc.lng, _geocoded: false };
+}
+
+async function newsToEvents(newsItems) {
     const events = [];
     for (const item of newsItems) {
         const countries = extractCountries(`${item.title} ${item.snippet || ''}`);
         for (const loc of countries) {
+            const coords = await resolveEventCoords(loc);
             events.push({
-                lat: loc.lat, lng: loc.lng,
+                lat: coords.lat, lng: coords.lng,
                 title: item.title, url: item.link, source: item.source,
                 snippet: item.snippet || '', tone: item.tone || 0,
                 _isGdelt: false, _severity: null, _category: null, _weight: 1.0,
+                _geocoded: coords._geocoded,
             });
         }
     }
@@ -282,7 +307,7 @@ function newsToEvents(newsItems) {
 async function runDiscovery() {
     try {
         const geoEvents = await fetchAllGeoEvents();
-        const newsEvents = newsToEvents(cachedNews);
+        const newsEvents = await newsToEvents(cachedNews);
         console.log(`[discovery] GDELT: ${geoEvents.length}, RSS: ${newsEvents.length}`);
 
         const all = [...geoEvents, ...newsEvents];

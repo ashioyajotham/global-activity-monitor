@@ -67,6 +67,18 @@ function init() {
             detected_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- Geocode cache: persists Google Geocoding API results across restarts
+        -- so repeated place mentions (e.g. "Goma" appearing in 50 articles
+        -- over a month) cost one API call, not one per mention.
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            query TEXT PRIMARY KEY,     -- normalized "place, country" lookup key
+            lat REAL,
+            lng REAL,
+            formatted_address TEXT,
+            found INTEGER NOT NULL DEFAULT 1,  -- 0 = confirmed no-result (still cached, don't retry)
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         -- Indexes for common queries
         CREATE INDEX IF NOT EXISTS idx_snap_name ON situation_snapshots(name);
         CREATE INDEX IF NOT EXISTS idx_snap_time ON situation_snapshots(recorded_at);
@@ -258,6 +270,7 @@ function getStats() {
         escalations: db.prepare('SELECT COUNT(*) as count FROM escalations').get().count,
         oldestSnapshot: db.prepare('SELECT MIN(recorded_at) as oldest FROM situation_snapshots').get()?.oldest,
         dbSizeMB: (require('fs').statSync(DB_PATH).size / (1024 * 1024)).toFixed(2),
+        geocodeCacheEntries: getGeocodeCacheCount(),
     };
 }
 
@@ -284,10 +297,49 @@ function close() {
     }
 }
 
+// ═══════════════════════════════════════════════════════
+// GEOCODE CACHE
+// ═══════════════════════════════════════════════════════
+
+/**
+ * Look up a cached geocode result. Returns undefined if never queried,
+ * or { lat, lng, formattedAddress, found } if it was (found=false means
+ * we already asked Google and got no result — don't ask again).
+ */
+function getCachedGeocode(query) {
+    const row = db.prepare('SELECT lat, lng, formatted_address, found FROM geocode_cache WHERE query = ?').get(query);
+    if (!row) return undefined;
+    return { lat: row.lat, lng: row.lng, formattedAddress: row.formatted_address, found: !!row.found };
+}
+
+/**
+ * Persist a geocode result (or a confirmed miss) so we never re-query it.
+ */
+function setCachedGeocode(query, result) {
+    db.prepare(`
+        INSERT INTO geocode_cache (query, lat, lng, formatted_address, found)
+        VALUES (@query, @lat, @lng, @formattedAddress, @found)
+        ON CONFLICT(query) DO UPDATE SET
+            lat = excluded.lat, lng = excluded.lng,
+            formatted_address = excluded.formatted_address, found = excluded.found
+    `).run({
+        query,
+        lat: result?.lat ?? null,
+        lng: result?.lng ?? null,
+        formattedAddress: result?.formattedAddress ?? null,
+        found: result ? 1 : 0,
+    });
+}
+
+function getGeocodeCacheCount() {
+    return db.prepare('SELECT COUNT(*) as count FROM geocode_cache').get().count;
+}
+
 module.exports = {
     init, close,
     storeSituations, storeArticles, storeEscalation,
     getScoreTrend, getAllTrends, getLatestSituations, recoverPreviousStates,
     getEscalationHistory, getEscalationsForSituation,
     getSnapshotCount, getArticleCount, getStats, cleanup,
+    getCachedGeocode, setCachedGeocode, getGeocodeCacheCount,
 };

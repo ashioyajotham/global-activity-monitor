@@ -410,6 +410,38 @@ curl http://localhost:4000/api/trends/Iran%20-%20United%20States?days=7
 
 ---
 
+## Precise geocoding (Google Maps Platform, optional)
+
+By default, RSS/DOC headline mentions resolve to a **country centroid** (the
+capital's coordinates) via the `countries-data.js` gazetteer — a headline
+about Goma and one about Kinshasa both land on the same dot. This is
+especially inaccurate for large countries and is the project's own
+documented #1 accuracy gap (`ARCHITECTURE_PLAN.md`, item #2).
+
+Setting `GOOGLE_MAPS_API_KEY` in `.env` turns on `geocoding.js`, which
+forward-geocodes the *specific* place mentioned (city, capital, or named
+region — e.g. "Goma, DR Congo") via the Google Geocoding API instead of
+falling back to the country centroid. Behavior:
+
+- **Fail-open by design.** No key → identical behavior to before (country
+  centroid). Any API error, timeout, or missing result → falls back to the
+  centroid for that event. Geocoding is never on the critical path for
+  discovery to succeed.
+- **Only geocodes when there's something more precise to gain.** A
+  headline that only mentions a bare country name ("Kenya") skips the API
+  call entirely — the centroid already is the best answer there.
+- **Cached forever**, in-memory and in SQLite (`geocode_cache` table), keyed
+  by normalized `"place, country"` — a place name is typically geocoded
+  once, ever, not once per article.
+- **Self-imposed daily call budget** (`GEOCODE_DAILY_BUDGET`, default 2500)
+  as a cost safety valve, independent of Google's own quota.
+- GDELT-sourced events are unaffected — GDELT already returns real
+  coordinates from its own geocoder; this only upgrades the RSS-derived path.
+
+Check `/api/health` for live geocoding status (enabled, calls today, budget).
+
+---
+
 ## Known limitations
 
 **Keyword-based classification.** Severity scoring and noise filtering still use hardcoded term lists. The `ARCHITECTURE_PLAN.md` documents the path toward GDELT CAMEO event codes, which would replace keyword guessing with structured classification data.
