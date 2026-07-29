@@ -410,7 +410,7 @@ curl http://localhost:4000/api/trends/Iran%20-%20United%20States?days=7
 
 ---
 
-## Precise geocoding (Google Maps Platform, optional)
+## Precise geocoding (Google Maps Platform)
 
 By default, RSS/DOC headline mentions resolve to a **country centroid** (the
 capital's coordinates) via the `countries-data.js` gazetteer — a headline
