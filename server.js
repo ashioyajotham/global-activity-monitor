@@ -1,513 +1,194 @@
-/**
- * server.js — Global Activity Monitor Backend
- * v4.1: Better error logging, fixed GDELT queries, concurrent RSS fetching.
- */
-
-const fs = require('fs');
-const path = require('path');
-
-// Load .env variables into process.env if .env file exists
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
 try {
-    const envPath = path.join(__dirname, '.env');
-    if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf8');
-        for (const line of envContent.split(/\r?\n/)) {
-            const trimmed = line.trim();
-            if (trimmed && !trimmed.startsWith('#')) {
-                const eqIdx = trimmed.indexOf('=');
-                if (eqIdx > 0) {
-                    const key = trimmed.slice(0, eqIdx).trim();
-                    const val = trimmed.slice(eqIdx + 1).trim();
-                    if (!process.env[key]) process.env[key] = val;
-                }
-            }
-        }
+    for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
+        const match = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (match && process.env[match[1]] === undefined) process.env[match[1]] = match[2].replace(/^(['"])(.*)\1$/, '$2');
     }
-} catch (e) { console.error('[env] Error loading .env:', e.message); }
-
+} catch (error) { if (error.code !== 'ENOENT') throw error; }
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const cron = require('node-cron');
-const cors = require('cors');
-const http = require('http');
-
+const http = require('node:http');
+const { timingSafeEqual } = require('node:crypto');
 const { fetchAllNews } = require('./feeds');
-const {
-    THEME_GROUPS, buildGeoQuery, buildDocQuery,
-    parseGeoResponse, parseDocResponse,
-    extractCountries, discoverSituations,
-    isNoiseHeadline, categorizeText,
-} = require('./discovery');
+const { THEME_GROUPS, buildGeoQuery, buildDocQuery, parseGeoResponse, parseDocResponse } = require('./discovery');
+const { runPipeline, advanceAlerts, VERSION, WINDOW_MS, classify, normalizeArticle } = require('./pipeline');
 const db = require('./db');
 const { geocodePlace, isEnabled: geocodingEnabled } = require('./geocoding');
-
-const PORT = process.env.PORT || 4000;
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || null;
-const AUTH_USER = process.env.AUTH_USER || 'monitor';
-
-// ═══════════════════════════════════════════════════════
-// STATE
-// ═══════════════════════════════════════════════════════
-
-let cachedActivities = [];
-let cachedNews = [];
-let dataSource = 'bootstrap';
-let lastGdeltFetch = null;
-let lastNewsFetch = null;
-let discoveryCount = 0;
-let previousStates = new Map();
-const STATUS_RANK = { stable: 0, elevated: 1, critical: 2 };
-
-function detectEscalations(newSituations) {
-    const escalations = [];
-    for (const sit of newSituations) {
-        const prev = previousStates.get(sit.name);
-        const newR = STATUS_RANK[sit.status] ?? 0;
-        const prevR = prev ? (STATUS_RANK[prev] ?? 0) : -1;
-        if (prev && newR > prevR) {
-            const esc = { name: sit.name, from: prev, to: sit.status, score: sit.score, type: sit.type, lat: sit.lat, lng: sit.lng, time: new Date().toISOString() };
-            escalations.push(esc);
-            try { db.storeEscalation(esc); } catch (e) { console.error('[db]', e.message); }
-            console.log(`[ESCALATION] ${sit.name}: ${prev} → ${sit.status} (${sit.score})`);
-        }
-        previousStates.set(sit.name, sit.status);
+const { loadModel, predict, promotionAllowed } = require('./model');
+const PASSWORD = process.env.AUTH_PASSWORD || '';
+const USER = process.env.AUTH_USER || 'monitor';
+const PORT = Number(process.env.PORT || 4000);
+const HOST = process.env.HOST || '127.0.0.1';
+const STALE_MS = 20 * 60000;
+function same(a, b) { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
+function authenticated(req) {
+    if (!PASSWORD) return true;
+    try { const raw = Buffer.from((req.headers.authorization || '').replace(/^Basic /, ''), 'base64').toString();
+        const colon = raw.indexOf(':'); return same(raw.slice(0,colon), USER) && same(raw.slice(colon + 1), PASSWORD); } catch { return false; }
+}
+function localRequest(req) { return ['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress); }
+function positive(value, fallback, max) { const n = Number(value); return Number.isInteger(n) && n > 0 ? Math.min(n,max) : fallback; }
+async function fetchJson(url, timeout = 25000) {
+    const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+        const response = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'GlobalActivityMonitor/5.0' } });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json(); // deadline covers the response body too
+    } finally { clearTimeout(timer); }
+}
+async function fetchGdelt() {
+    const events = [], sources = [];
+    const requests = THEME_GROUPS.flatMap(theme => [{ theme, kind: 'geo' }, { theme, kind: 'doc' }]);
+    for (let i = 0; i < requests.length; i++) {
+        const { theme, kind } = requests[i];
+        try {
+            const data = await fetchJson(kind === 'geo' ? buildGeoQuery(theme.geoQuery) : buildDocQuery(theme.docQuery));
+            if (kind === 'geo' ? !Array.isArray(data.features) : !Array.isArray(data.articles)) throw new Error('Unexpected response schema');
+            const parsed = kind === 'geo' ? parseGeoResponse(data,theme) : parseDocResponse(data,theme);
+            events.push(...parsed); sources.push({ id: `${kind}:${theme.id}`, status:'ok', count:parsed.length });
+        } catch (error) { sources.push({ id:`${kind}:${theme.id}`, status:'failed', error: error.name === 'AbortError' ? 'timeout' : error.message }); }
+        if (i < requests.length - 1) await new Promise(resolve => setTimeout(resolve,5500));
     }
-    return escalations;
+    return { events, sources };
 }
-
-// ═══════════════════════════════════════════════════════
-// AUTH
-// ═══════════════════════════════════════════════════════
-
-function authMiddleware(req, res, next) {
-    if (!AUTH_PASSWORD) return next();
-    if (req.path === '/api/health') return next();
-    const h = req.headers.authorization;
-    if (!h || !h.startsWith('Basic ')) { res.set('WWW-Authenticate', 'Basic realm="Monitor"'); return res.status(401).send('Auth required'); }
-    try { const [u, p] = Buffer.from(h.split(' ')[1], 'base64').toString().split(':'); if (u === AUTH_USER && p === AUTH_PASSWORD) return next(); } catch {}
-    res.set('WWW-Authenticate', 'Basic realm="Monitor"'); res.status(401).send('Invalid credentials');
-}
-
-function authenticateWs(req) {
-    if (!AUTH_PASSWORD) return true;
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.searchParams.get('token') === AUTH_PASSWORD) return true;
-    const h = req.headers.authorization;
-    if (h?.startsWith('Basic ')) { try { const [u, p] = Buffer.from(h.split(' ')[1], 'base64').toString().split(':'); return u === AUTH_USER && p === AUTH_PASSWORD; } catch {} }
-    return false;
-}
-
-// ═══════════════════════════════════════════════════════
-// EXPRESS
-// ═══════════════════════════════════════════════════════
-
-const app = express();
-app.use(cors());
-app.use(authMiddleware);
-app.use(express.static(path.join(__dirname)));
-
-app.get('/api/activities', (_, res) => res.json({ activities: cachedActivities, source: dataSource, lastFetch: lastGdeltFetch, count: cachedActivities.length, discoveryCount }));
-app.get('/api/news', (_, res) => res.json({ news: cachedNews, lastFetch: lastNewsFetch, count: cachedNews.length }));
-
-app.get('/api/health', (_, res) => {
-    let s = {};
-    try { s = db.getStats(); } catch (e) { s = { error: e.message }; }
-    res.json({
-        status: 'ok', uptime: process.uptime(), activities: cachedActivities.length, db: s,
-        geocoding: require('./geocoding').getStatus(),
+function createApp({ fetchGdeltImpl = fetchGdelt, fetchNewsImpl = fetchAllNews, now = () => new Date().toISOString() } = {}) {
+    const app = express();
+    app.disable('x-powered-by');
+    app.use((req,res,next) => {
+        if (req.path === '/api/health' || authenticated(req)) return next();
+        res.set('WWW-Authenticate','Basic realm="Monitor"').status(401).send('Authentication required');
     });
-});
-
-app.get('/api/trends', (req, res) => {
-    try {
-        const h = Math.min(parseInt(req.query.hours) || 24, 168);
-        const t = db.getAllTrends(h);
-        res.json({
-            trends: t.map(r => ({
-                ...r,
-                direction: r.last_score > r.first_score ? 'up' : r.last_score < r.first_score ? 'down' : 'stable',
-                delta: Math.round((r.last_score - r.first_score) * 10) / 10,
-            })),
-            hours: h,
-        });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/trends/:name', (req, res) => {
-    try {
-        const d = Math.min(parseInt(req.query.days) || 7, 30);
-        res.json({ name: req.params.name, trend: db.getScoreTrend(req.params.name, d), escalations: db.getEscalationsForSituation(req.params.name, d) });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/escalations', (req, res) => {
-    try { res.json({ escalations: db.getEscalationHistory(Math.min(parseInt(req.query.limit) || 50, 200)) }); }
-    catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/stats', (_, res) => {
-    try { res.json(db.getStats()); } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ═══════════════════════════════════════════════════════
-// GDELT FETCHERS — with diagnostic error logging
-// ═══════════════════════════════════════════════════════
-
-/**
- * Extract the real error message from Node.js fetch failures.
- * On Windows, errors nest: TypeError("fetch failed") → cause → cause → actual error
- */
-function unwrapFetchError(e) {
-    // Walk the cause chain to find the real error
-    let current = e;
-    const parts = [];
-    let depth = 0;
-    while (current && depth < 5) {
-        if (current.code) parts.push(`code=${current.code}`);
-        if (current.message && current.message !== 'fetch failed') parts.push(current.message);
-        if (current.syscall) parts.push(`syscall=${current.syscall}`);
-        if (current.hostname) parts.push(`host=${current.hostname}`);
-        current = current.cause;
-        depth++;
+    app.use(express.json({ limit:'32kb' }));
+    // Explicit public allowlist: no .env, database, source files, or model artifacts.
+    app.get('/', (_,res) => res.sendFile(path.join(__dirname,'index.html')));
+    app.use('/assets',express.static(path.join(__dirname,'public'), { dotfiles:'deny', index:false }));
+    const reviewAccess = (req,res,next) => {
+        if (!localRequest(req) && !PASSWORD) return res.status(403).json({ error:'Review access requires localhost or authentication' });
+        if (req.method !== 'GET') {
+            const origin = req.headers.origin;
+            if (origin && origin !== `${req.protocol}://${req.get('host')}`) return res.status(403).json({ error:'Cross-origin review writes are disabled' });
+            if (!req.is('application/json') || req.get('X-Review-Request') !== '1') return res.status(403).json({ error:'Review request header required' });
+        }
+        next();
+    };
+    app.get('/review',reviewAccess,(_,res) => res.sendFile(path.join(__dirname,'public/review.html')));
+    let latest = db.getState('latest', { situations:[], health:{ status:'bootstrap', sources:[] }, recordedAt:null });
+    let news = [], newsHealth = { status:'bootstrap' }, newsFetchedAt = null, fetchingNews = null, discovering = null;
+    let wss = null, model = null;
+    if (process.env.MODEL_PATH) {
+        try { model = loadModel(process.env.MODEL_PATH); db.recordModel({ hash:model.hash, version:model.version, path:process.env.MODEL_PATH }); }
+        catch (error) { console.error('[model] Disabled:',error.message); }
     }
-    return parts.length > 0 ? parts.join(' | ') : (e.message || 'unknown error');
-}
-
-async function fetchWithTimeout(url, ms = 25000) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ms);
-    try {
-        const res = await fetch(url, {
-            signal: ctrl.signal,
-            headers: { 'User-Agent': 'GlobalActivityMonitor/4.1' },
-        });
-        clearTimeout(timer);
-        return res;
-    } catch (e) {
-        clearTimeout(timer);
-        if (e.name === 'AbortError') throw new Error(`timeout after ${ms}ms`);
-        throw new Error(unwrapFetchError(e));
+    const mode = process.env.CLASSIFIER_MODE === 'model' ? 'model' : 'rules';
+    const promoted = model && mode === 'model' && promotionAllowed(model,process.env.MODEL_PROMOTION_PATH,db.shadowReport(model.hash));
+    if (mode === 'model' && !promoted) console.error('[model] Promotion gates unmet; using rules');
+    function envelope() {
+        const timestamp = now();
+        const stale = !latest.recordedAt || Date.parse(timestamp) - Date.parse(latest.recordedAt) > STALE_MS || latest.health.status === 'failed';
+        const activities = latest.situations.map(s => ({ ...s,
+            evidenceState: stale || !s.newestEvidenceAt || Date.parse(timestamp) - Date.parse(s.newestEvidenceAt) > WINDOW_MS ? 'developing' : s.evidenceState,
+            stale,
+        })).map(s => ({ ...s, status: s.evidenceState === 'confirmed' ? s.status : 'developing' }));
+        return { activities, count:activities.length, pipelineVersion:VERSION, classifier:promoted ? model.hash : 'rules',
+            source:!latest.recordedAt ? 'bootstrap' : stale ? 'stale' : latest.health.status === 'ok' ? 'live' : latest.health.status,
+            lastFetch:latest.recordedAt, health:{ ...latest.health, stale, news:newsHealth }, model: model ? { hash:model.hash, mode:promoted ? 'model' : 'shadow' } : null };
     }
-}
-
-async function fetchGeoForTheme(themeGroup, logUrl = false, attempt = 1) {
-    const url = buildGeoQuery(themeGroup.geoQuery);
-    if (logUrl) console.log(`[gdelt-geo] Testing URL: ${url}`);
-    try {
-        const res = await fetchWithTimeout(url);
-        if (res.status === 429 && attempt <= 2) {
-            console.warn(`[gdelt-geo] ${themeGroup.id}: Rate limited (HTTP 429), retrying in 6s (attempt ${attempt}/2)...`);
-            await delay(6000);
-            return fetchGeoForTheme(themeGroup, false, attempt + 1);
-        }
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-        }
-        const text = await res.text();
-        if (!text.trim().startsWith('{') && !text.trim().startsWith('[')) {
-            throw new Error(`Non-JSON: "${text.slice(0, 120)}..."`);
-        }
-        const events = parseGeoResponse(JSON.parse(text), themeGroup);
-        console.log(`[gdelt-geo] ${themeGroup.id}: ${events.length} events`);
-        return events;
-    } catch (e) {
-        console.error(`[gdelt-geo] ${themeGroup.id}: ${e.message}`);
-        return [];
-    }
-}
-
-async function fetchDocForTheme(themeGroup, logUrl = false, attempt = 1) {
-    const url = buildDocQuery(themeGroup.docQuery);
-    if (logUrl) console.log(`[gdelt-doc] Testing URL: ${url}`);
-    try {
-        const res = await fetchWithTimeout(url);
-        if (res.status === 429 && attempt <= 2) {
-            console.warn(`[gdelt-doc] ${themeGroup.id}: Rate limited (HTTP 429), retrying in 6s (attempt ${attempt}/2)...`);
-            await delay(6000);
-            return fetchDocForTheme(themeGroup, false, attempt + 1);
-        }
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-        }
-        const data = await res.json();
-        const articles = parseDocResponse(data, themeGroup);
-        console.log(`[gdelt-doc] ${themeGroup.id}: ${articles.length} geolocated`);
-        return articles;
-    } catch (e) {
-        console.error(`[gdelt-doc] ${themeGroup.id}: ${e.message}`);
-        return [];
-    }
-}
-
-/**
- * Fetch events across all theme groups.
- * Sequential with 5.5s delays to strictly respect GDELT rate limits (max 1 req / 5s).
- *
- * Rate budget: ~12 calls per cycle
- *   7 GEO queries + up to 5 DOC queries
- *   5.5s delay between each = ~66s total when all succeed
- */
-async function fetchAllGeoEvents() {
-    console.log(`[gdelt] Scanning ${THEME_GROUPS.length} theme groups (GEO + DOC)...`);
-    const start = Date.now();
-    const allEvents = [];
-    let geoOk = 0, geoFail = 0, docOk = 0, docFail = 0;
-
-    // Sort by weight (highest severity first)
-    const sorted = [...THEME_GROUPS].sort((a, b) => b.weight - a.weight);
-
-    for (let i = 0; i < sorted.length; i++) {
-        const tg = sorted[i];
-        const isFirst = (i === 0);
-
-        // GEO query for every theme group
-        const geoEvents = await fetchGeoForTheme(tg, isFirst);
-        if (geoEvents.length > 0) geoOk++; else geoFail++;
-        allEvents.push(...geoEvents);
-
-        // Respect GDELT 5-second rate limit between calls
-        await delay(5500);
-
-        // DOC query for top 5 themes (rate budget)
-        if (i < 5) {
-            const docEvents = await fetchDocForTheme(tg, isFirst);
-            if (docEvents.length > 0) docOk++; else docFail++;
-            allEvents.push(...docEvents);
-            await delay(5500);
-        }
-    }
-
-    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`[gdelt] Done in ${elapsed}s: ${allEvents.length} events (GEO: ${geoOk}ok/${geoFail}fail, DOC: ${docOk}ok/${docFail}fail)`);
-
-    if (allEvents.length === 0 && geoFail === sorted.length) {
-        console.error('[gdelt] ⚠ ALL queries failed — check network or GDELT API status');
-    }
-
-    return allEvents;
-}
-
-function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ═══════════════════════════════════════════════════════
-// NEWS → EVENTS
-// ═══════════════════════════════════════════════════════
-
-/**
- * Resolve a matched location to coordinates. Uses the Geocoding API for
- * anything more specific than a bare country mention (capital, city, named
- * region) so events land on the real place instead of the country
- * centroid. Falls back to the centroid whenever geocoding isn't available
- * or doesn't return a result — this never throws and never blocks on a
- * missing API key.
- */
-async function resolveEventCoords(loc) {
-    // SPECIFICITY.COUNTRY (1) means only the bare country/abbrev/code
-    // matched — there's no more precise term to geocode, the centroid
-    // IS the best we can do.
-    if (geocodingEnabled() && loc.specificity > 1) {
-        const geocoded = await geocodePlace(loc.matchedTerm, loc.name);
-        if (geocoded) return { lat: geocoded.lat, lng: geocoded.lng, _geocoded: true };
-    }
-    return { lat: loc.lat, lng: loc.lng, _geocoded: false };
-}
-
-async function newsToEvents(newsItems) {
-    const events = [];
-    let noiseFiltered = 0, nonGeoFiltered = 0;
-
-    for (const item of newsItems) {
-        const text = `${item.title} ${item.snippet || ''}`;
-
-        // Tier 1: Sports, Entertainment, Lifestyle Noise Filter
-        if (isNoiseHeadline(text)) {
-            noiseFiltered++;
-            continue;
-        }
-
-        // Tier 2: Geopolitical Category Matching
-        const category = categorizeText(text);
-
-        // Tier 3: Skip generic non-geopolitical items (unless tone is strongly negative < -2.0)
-        if (!category && (item.tone ?? 0) > -2.0) {
-            nonGeoFiltered++;
-            continue;
-        }
-
-        const countries = extractCountries(text);
-        for (const loc of countries) {
-            const coords = await resolveEventCoords(loc);
-            const isCriticalCat = category === 'Armed Conflict' || category === 'Military Operations' || category === 'Terrorism';
-            events.push({
-                lat: coords.lat, lng: coords.lng,
-                title: item.title, url: item.link, source: item.source,
-                snippet: item.snippet || '', tone: item.tone || 0,
-                _isGdelt: false,
-                _severity: category ? (isCriticalCat ? 'critical' : 'elevated') : 'moderate',
-                _category: category || 'General News',
-                _weight: category ? 1.2 : 0.8,
-                _geocoded: coords._geocoded,
-            });
-        }
-    }
-    if (noiseFiltered > 0 || nonGeoFiltered > 0) {
-        console.log(`[news-filter] Filtered ${noiseFiltered} sports/entertainment noise, ${nonGeoFiltered} non-geopolitical articles`);
-    }
-    return events;
-}
-
-// ═══════════════════════════════════════════════════════
-// DISCOVERY PIPELINE
-// ═══════════════════════════════════════════════════════
-
-async function runDiscovery() {
-    try {
-        const geoEvents = await fetchAllGeoEvents();
-        const newsEvents = await newsToEvents(cachedNews);
-        console.log(`[discovery] GDELT: ${geoEvents.length}, RSS: ${newsEvents.length}`);
-
-        const all = [...geoEvents, ...newsEvents];
-        if (all.length === 0) {
-            console.log('[discovery] No events available — skipping cycle');
-            return cachedActivities;
-        }
-
-        console.log(`[discovery] Total to cluster: ${all.length}`);
-        const situations = discoverSituations(all);
-        console.log(`[discovery] Result: ${situations.length} situations`);
-
-        if (situations.length > 0) {
-            const escalations = detectEscalations(situations);
-            cachedActivities = situations;
-            dataSource = 'live';
-            lastGdeltFetch = new Date().toISOString();
-            discoveryCount++;
-
+    function broadcast(data) { if (wss) for (const c of wss.clients) if (c.readyState === 1) c.send(JSON.stringify(data)); }
+    async function refreshNews() {
+        if (fetchingNews) return fetchingNews;
+        fetchingNews = (async () => {
             try {
-                db.storeSituations(situations);
-                for (const s of situations) if (s.topArticles?.length) db.storeArticles(s.topArticles, s.name);
-                console.log(`[db] Cycle #${discoveryCount}: ${situations.length} stored`);
-            } catch (e) { console.error('[db]', e.message); }
-
-            broadcast({ type: 'activities_update', activities: cachedActivities });
-            if (escalations.length > 0) broadcast({ type: 'escalation', escalations });
-        }
-        return situations;
-    } catch (e) {
-        console.error('[discovery] Error:', e.message);
-        return cachedActivities;
+                const result = await fetchNewsImpl();
+                const status = result.health.failed === 0 ? 'ok' : result.health.success ? 'partial' : 'failed';
+                newsHealth = { status,...result.health };
+                if (status !== 'failed') { news = result.items; newsFetchedAt = now(); }
+                broadcast({ type:'news_update', items:news.slice(0,100), replace:true, health:newsHealth, lastFetch:newsFetchedAt });
+            } catch (error) { newsHealth = { status:'failed', error:error.message }; }
+        })().finally(() => { fetchingNews = null; });
+        return fetchingNews;
     }
-}
-
-async function refreshNews() {
-    try {
-        const items = await fetchAllNews();
-        if (items.length > 0) {
-            const oldTitles = new Set(cachedNews.map(n => n.title));
-            const newItems = items.filter(n => !oldTitles.has(n.title));
-            cachedNews = items.slice(0, 100);
-            lastNewsFetch = new Date().toISOString();
-            if (newItems.length > 0) {
-                console.log(`[news] ${newItems.length} new items`);
-                broadcast({ type: 'news_update', items: newItems.slice(0, 15) });
+    async function runDiscovery() {
+        if (discovering) return discovering;
+        discovering = (async () => {
+            try {
+                if (!newsFetchedAt || Date.parse(now()) - Date.parse(newsFetchedAt) >= 5 * 60000) await refreshNews();
+                const gdelt = await fetchGdeltImpl();
+                const timestamp = now();
+                const sources = [...gdelt.sources,{ id:'rss',...newsHealth }];
+                const failed = sources.filter(s => s.status !== 'ok').length;
+                const status = sources.every(s => s.status === 'failed') ? 'failed' : failed ? 'partial' : 'ok';
+                if (status === 'failed') {
+                    const alerts = advanceAlerts([],db.getState('alertState',{}),{ successful:false, now:timestamp });
+                    db.setState('alertState',alerts.state);
+                    latest = { ...latest, health:{ status,sources } }; db.setState('latest',latest);
+                    broadcast({ type:'activities_update',...envelope() }); return envelope();
+                }
+                const raw = [...gdelt.events,...news];
+                // Optional precise geocoding is only attempted after relevance, on every article provider.
+                if (geocodingEnabled()) for (const item of raw) {
+                    const article = normalizeArticle(item,timestamp);
+                    if (classify(article).relevance !== 'relevant') continue;
+                    const locations = require('./countries-data').extractCountries(`${article.title} ${article.snippet}`);
+                    if (locations.length !== 1 || locations[0].specificity <= 1) continue;
+                    const loc = locations[0], coords = await geocodePlace(loc.matchedTerm,loc.name,loc.code);
+                    if (coords) Object.assign(item,{lat:coords.lat,lng:coords.lng,_geocoded:true});
+                }
+                const result = runPipeline(raw,{ previous:db.getState('identities',latest.situations), now:timestamp, model:promoted ? model : null });
+                if (model) for (const a of result.articles) {
+                    if (a.geoOnly || !/^(en|english)$/i.test(a.language)) continue;
+                    db.recordShadow(a,model.hash,predict(model,`${a.title}. ${a.snippet}`),timestamp);
+                }
+                const alerts = advanceAlerts(result.situations,db.getState('alertState',{}),{ successful:status === 'ok', now:timestamp });
+                const health = { status,sources };
+                db.storeCycle(result,health,alerts.state,alerts.alerts,timestamp);
+                latest = { situations:result.situations, health, recordedAt:timestamp };
+                broadcast({ type:'activities_update',...envelope() });
+                if (alerts.alerts.length) broadcast({ type:'escalation',escalations:alerts.alerts });
+                return envelope();
+            } catch (error) {
+                latest = { ...latest, health:{ ...latest.health,status:'failed',error:error.message } };
+                db.setState('latest',latest);
+                db.setState('alertState',advanceAlerts([],db.getState('alertState',{}),{successful:false}).state);
+                broadcast({type:'activities_update',...envelope()});
+                console.error('[discovery]',error.message); return envelope();
             }
-        }
-    } catch (e) { console.error('[news]', e.message); }
+        })().finally(() => { discovering = null; });
+        return discovering;
+    }
+    app.get('/api/activities',(_,res) => res.json(envelope()));
+    app.get('/api/news',(_,res) => res.json({news:news.slice(0,100),health:newsHealth,lastFetch:newsFetchedAt}));
+    app.get('/api/health',(_,res) => res.json({status:envelope().source,pipelineVersion:VERSION,uptime:process.uptime(),lastFetch:latest.recordedAt}));
+    app.get('/api/stats',(_,res) => res.json(db.getStats()));
+    app.get('/api/trends',(_,res) => res.json({pipelineVersion:VERSION,trends:latest.situations.map(s => ({id:s.id,name:s.name,points:db.getTrend(s.id,1)}))}));
+    app.get('/api/trends/:id',(req,res) => res.json({id:req.params.id,pipelineVersion:VERSION,trend:db.getTrend(req.params.id,positive(req.query.days,7,30))}));
+    app.get('/api/escalations',(req,res) => res.json({escalations:db.getAlerts(positive(req.query.limit,50,200))}));
+    app.get('/api/review',reviewAccess,(req,res) => res.json({items:db.reviewQueue(positive(req.query.limit,25,100),Math.max(0,Number(req.query.offset)||0),req.query.reviewed === 'true')}));
+    app.get('/api/review/export',reviewAccess,(_,res) => res.json({pipelineVersion:VERSION,items:db.exportLabels()}));
+    app.post('/api/review/:id',reviewAccess,(req,res,next) => { try { res.json(db.saveLabel(req.params.id,req.body.label,req.body.revision)); } catch(error) { next(error); } });
+    app.get('/api/model/shadow',reviewAccess,(_,res) => res.json({model:model?.hash || null,rows:model ? db.shadowReport(model.hash) : []}));
+    app.use((error,req,res,next) => { res.status(error.status || 500).json({error:error.status ? error.message : 'Internal error'}); });
+    return { app, runDiscovery, refreshNews, envelope, attachWebSocket(server) {
+        wss = new WebSocketServer({noServer:true});
+        server.on('upgrade',(req,socket,head) => {
+            const origin = req.headers.origin;
+            if (req.url !== '/ws' || !authenticated(req) || (origin && origin !== `http://${req.headers.host}` && origin !== `https://${req.headers.host}`)) { socket.end('HTTP/1.1 403 Forbidden\r\n\r\n'); return; }
+            wss.handleUpgrade(req,socket,head,ws => wss.emit('connection',ws,req));
+        });
+        wss.on('connection',ws => ws.send(JSON.stringify({type:'init',...envelope(),news:news.slice(0,100)})));
+    }, close() { if (wss) { for (const c of wss.clients) c.terminate(); wss.close(); } } };
 }
-
-// ═══════════════════════════════════════════════════════
-// WEBSOCKET + STARTUP
-// ═══════════════════════════════════════════════════════
-
-let wss;
-function broadcast(data) {
-    if (!wss) return;
-    const payload = JSON.stringify(data);
-    wss.clients.forEach(c => { if (c.readyState === 1) c.send(payload); });
-}
-
 async function start() {
     db.init();
-    try {
-        previousStates = db.recoverPreviousStates();
-        console.log(`[db] Recovered ${previousStates.size} previous states`);
-    } catch {}
-
-    const server = http.createServer(app);
-    wss = new WebSocketServer({ noServer: true });
-
-    server.on('upgrade', (req, socket, head) => {
-        if (!authenticateWs(req)) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
-        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-    });
-
-    wss.on('connection', ws => {
-        console.log('[ws] Client connected');
-        ws.send(JSON.stringify({ type: 'init', activities: cachedActivities, news: cachedNews.slice(0, 30) }));
-        ws.on('close', () => console.log('[ws] Client disconnected'));
-    });
-
-    server.listen(PORT, () => {
-        console.log('═══════════════════════════════════════════');
-        console.log('  GLOBAL ACTIVITY MONITOR v4.2');
-        console.log('═══════════════════════════════════════════');
-        console.log(`  http://localhost:${PORT}`);
-        console.log(`  Auth: ${AUTH_PASSWORD ? 'ON' : 'OFF'}`);
-        console.log(`  Theme groups: ${THEME_GROUPS.length}`);
-        console.log(`  RSS feeds: ${require('./feeds').FEEDS.length}`);
-        console.log(`  DB snapshots: ${db.getSnapshotCount()}`);
-        console.log('═══════════════════════════════════════════');
-    });
-
-    // Cron schedules
-    cron.schedule('*/10 * * * *', runDiscovery);
-    cron.schedule('*/5 * * * *', refreshNews);
-    cron.schedule('0 3 * * *', () => db.cleanup(30));
-
-    // Initial fetch
-    console.log('[startup] Fetching RSS feeds...');
-    await refreshNews();
-    // Diagnostic: test GDELT connectivity before first discovery cycle
-    console.log('[startup] Testing GDELT API connectivity...');
-    await testGdeltConnectivity();
-
-    console.log('[startup] Running GDELT discovery...');
-    await runDiscovery();
-    console.log('[startup] Ready');
+    const controller = createApp(), server = http.createServer(controller.app);
+    controller.attachWebSocket(server);
+    server.listen(PORT,HOST,() => console.log(`Monitor ${VERSION}: http://${HOST}:${PORT}`));
+    const timers = [setInterval(controller.runDiscovery,10*60000),setInterval(controller.refreshNews,5*60000),setInterval(() => db.cleanup(30),24*60*60000)];
+    await controller.refreshNews();
+    controller.runDiscovery();
+    const stop = () => { timers.forEach(clearInterval); controller.close(); server.close(() => { db.close(); process.exit(0); }); setTimeout(() => process.exit(0),5000).unref(); };
+    process.once('SIGINT',stop); process.once('SIGTERM',stop);
 }
-
-/**
- * Startup diagnostic: test a simple known-working GDELT query.
- * This helps isolate network vs. query format issues.
- */
-async function testGdeltConnectivity() {
-    const testUrls = [
-        {
-            name: 'GEO simple',
-            url: 'https://api.gdeltproject.org/api/v2/geo/geo?query=conflict&mode=PointData&format=GeoJSON',
-        },
-        {
-            name: 'DOC simple',
-            url: 'https://api.gdeltproject.org/api/v2/doc/doc?query=conflict&mode=artlist&maxrecords=5&format=json&sort=datedesc',
-        },
-    ];
-
-    for (let i = 0; i < testUrls.length; i++) {
-        const test = testUrls[i];
-        if (i > 0) await delay(5500);
-        try {
-            console.log(`[diag] ${test.name}: ${test.url}`);
-            const res = await fetchWithTimeout(test.url, 25000);
-            const body = await res.text();
-            console.log(`[diag] ${test.name}: HTTP ${res.status}, ${body.length} bytes, starts with: "${body.slice(0, 80)}"`);
-        } catch (e) {
-            console.error(`[diag] ${test.name} FAILED: ${e.message}`);
-        }
-    }
-}
-
-process.on('SIGINT', () => { console.log('\n[shutdown] Closing...'); db.close(); process.exit(0); });
-process.on('SIGTERM', () => { db.close(); process.exit(0); });
-start().catch(e => { console.error('[fatal]', e); db.close(); process.exit(1); });
+if (require.main === module) start().catch(error => { console.error(error); db.close(); process.exitCode = 1; });
+module.exports = {createApp,fetchJson,fetchGdelt};

@@ -289,24 +289,20 @@ function extractCountries(text) {
     const lower = text.toLowerCase();
     const found = new Map(); // country name → { ...country, matchedTerm, specificity }
 
-    for (const [term, entry] of _nameIndex) {
-        // Skip very short terms that cause false positives (2-letter codes)
-        if (term.length <= 2) continue;
-
-        // Whole-word boundary match
+    const matchedSpans = [];
+    // Longest aliases first prevent South Sudan also matching Sudan, or DR Congo
+    // also matching Congo. Short official abbreviations require exact uppercase.
+    for (const [term, entry] of [..._nameIndex].sort((a,b)=>b[0].length-a[0].length)) {
+        if(term.length<=2 && !['us','uk','uae'].includes(term))continue;
         const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(`\\b${escaped}\\b`, 'i');
-        if (!regex.test(lower)) continue;
-
-        const existing = found.get(entry.country.name);
-        // Keep the MOST SPECIFIC match per country (a city/region mention
-        // is worth more than a bare country-name mention in the same
-        // headline — it's what geocoding.js should actually look up).
-        if (!existing || entry.specificity > existing.specificity) {
-            found.set(entry.country.name, {
-                ...entry.country,
-                matchedTerm: entry.matchedTerm,
-                specificity: entry.specificity,
+        const regex = new RegExp(`\\b${term.length<=2 ? escaped.toUpperCase() : escaped}\\b`, term.length<=2?'g':'gi');
+        for(const match of text.matchAll(regex)) {
+            const start=match.index,end=start+match[0].length;
+            if(matchedSpans.some(span=>start>=span[0] && end<=span[1]))continue;
+            matchedSpans.push([start,end]);
+            const existing=found.get(entry.country.name);
+            if(!existing || entry.specificity>existing.specificity)found.set(entry.country.name,{
+                ...entry.country,matchedTerm:entry.matchedTerm,specificity:entry.specificity
             });
         }
     }

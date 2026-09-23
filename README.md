@@ -1,5 +1,24 @@
 # Global Activity Monitor
 
+## v5 evidence pipeline
+
+The monitor now treats feeds as evidence about reported events. Search-query
+themes do not determine severity, duplicate or syndicated reports are grouped,
+dated evidence is limited to a rolling 24-hour window, and a primary situation
+needs two distinct reporting origins before it is confirmed. Developing reports
+remain visible separately and cannot trigger an escalation. The 0–10 value is a
+provisional reported-event-severity rubric; coverage and confidence are shown
+independently.
+
+The local classifier is deliberately staged. Rules are active by default and a
+review screen at `/review` collects source-linked labels. Python training,
+chronological group splits, held-out evaluation, and a seven-day shadow period
+are required before a model artifact can be promoted. No model is promoted by
+default.
+
+Run the regression suite with `npm test`. The offline ML workflow is documented
+in `ml/train.py`; it requires `scikit-learn` from `ml/requirements-lock.txt`.
+
 A real-time geopolitical situation tracker that autonomously discovers, scores, and visualises active global events on an interactive world map. No hardcoded watchlists, no manual configuration. The system observes global data feeds, clusters events by geographic proximity, and surfaces the situations that matter.
 
 ---

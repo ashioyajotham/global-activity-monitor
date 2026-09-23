@@ -161,6 +161,14 @@
         @keyframes news-slide-in{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:translateX(0)}}
         @media(max-width:900px){.news-river{display:none}.side-panel{width:100%}.activity-strip{display:none}}
         @media(max-width:600px){.header-stat{display:none}.data-source{display:none}}
+
+        .monitor-controls{padding:9px 24px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border-subtle);position:relative;z-index:11;font-size:11px}
+        select,button{color:var(--text-primary);background:var(--bg-card);border:1px solid var(--border-muted);border-radius:4px;padding:5px}
+        .monitor-controls a{color:var(--text-muted)}
+        #healthSummary{color:var(--text-muted)}
+        .strip-item:focus,.activity-dot:focus{outline:2px solid var(--amber-active)}
+        @media(max-width:900px){.activity-strip{display:flex;left:10px;bottom:10px;max-width:90%;max-height:140px}.header{padding:10px}.monitor-controls{padding:8px}.legend-attribution{display:none}}
+        @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
     </style>
 </head>
 <body>
@@ -182,6 +190,12 @@
             <div class="clock" id="clock">00:00:00 UTC</div>
         </div>
     </header>
+    <nav class="monitor-controls" aria-label="Monitor filters">
+        <label>Evidence <select id="evidenceFilter"><option value="confirmed">Confirmed</option><option value="developing">Developing</option><option value="all">All reports</option></select></label>
+        <label>Category <select id="categoryFilter"><option value="all">All categories</option></select></label>
+        <a href="/review">Review evidence</a><button id="enableNotifications">Enable alerts</button>
+        <span id="healthSummary" role="status">Waiting for first scan</span>
+    </nav>
     <main class="main">
         <div class="map-container" id="mapContainer">
             <div class="map-loading" id="mapLoading">Loading world map…</div>
@@ -203,7 +217,7 @@
             <div class="panel-body" id="panelBody"></div>
         </div>
         <aside class="news-river">
-            <div class="news-header"><div class="news-header-left"><div class="news-breaking-dot"></div><span class="news-header-title">Breaking</span></div><span class="news-count" id="newsCount">0 items</span></div>
+            <div class="news-header"><div class="news-header-left"><div class="news-breaking-dot"></div><span class="news-header-title">Source coverage</span></div><span class="news-count" id="newsCount">0 items</span></div>
             <div class="news-feed" id="newsFeed"><div class="news-empty">Connecting to news feeds…</div></div>
         </aside>
     </main>
@@ -214,7 +228,7 @@
             <div class="legend-item"><span class="legend-dot amber"></span><span>Elevated</span></div>
             <div class="legend-item"><span class="legend-dot green"></span><span>Monitoring</span></div>
         </div>
-        <span class="legend-attribution">Theme-Classified · GDELT GEO + DOC + RSS · Natural Earth · v4.1</span>
+        <span class="legend-attribution">Provisional reported severity · GDELT + RSS · Natural Earth</span>
     </footer>
 
     <script>
@@ -233,6 +247,30 @@
 
     let activities = [], newsItems = [], ws = null, wsConnected = false;
     let projection, pathGenerator, countryFeatures;
+    let selectedId = null, latestEnvelope = null;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    function safeLink(value) { try { const u = new URL(value); return ['http:','https:'].includes(u.protocol) ? u.href : ''; } catch { return ''; } }
+    function keyboardClick(el, action) { el.setAttribute('tabindex','0'); el.setAttribute('role','button'); el.addEventListener('keydown',e => { if(e.key === 'Enter' || e.key === ' ') { e.preventDefault(); action(); } }); }
+    function evidenceAge(value) { if (!value) return 'date unknown'; const minutes=Math.max(0,Math.floor((Date.now()-Date.parse(value))/60000)); return minutes<60 ? minutes+'m ago' : Math.floor(minutes/60)+'h ago'; }
+    function applyEnvelope(d) {
+        latestEnvelope=d; activities=d.activities || [];
+        const filter=document.getElementById('categoryFilter'), selected=filter.value;
+        filter.replaceChildren(new Option('All categories','all'), ...[...new Set(activities.map(a=>a.type))].sort().map(type=>new Option(type,type)));
+        filter.value=[...filter.options].some(o=>o.value===selected)?selected:'all';
+        renderActivities(activities); updateFreshness();
+        if(selectedId) { const current=activities.find(a=>a.id===selectedId); if(current) openPanel(current); else { panelBody.textContent='This situation has no current evidence in the active window.'; } }
+    }
+    function updateFreshness() {
+        if (!latestEnvelope) return;
+        const d=latestEnvelope, stale=!d.lastFetch || Date.now()-Date.parse(d.lastFetch)>20*60000 || d.health?.stale;
+        updateSource(!d.lastFetch?'STARTING':stale?'STALE':String(d.source || 'bootstrap').toUpperCase());
+        const sources=d.health?.sources || [], failures=sources.filter(s=>s.status!=='ok').length;
+        document.getElementById('healthSummary').textContent=(d.lastFetch?'Scan '+evidenceAge(d.lastFetch):'Awaiting first scan')+' · '+failures+'/'+sources.length+' source groups degraded';
+        renderActivities(activities);
+    }
+    document.getElementById('evidenceFilter').addEventListener('change',()=>renderActivities(activities));
+    document.getElementById('categoryFilter').addEventListener('change',()=>renderActivities(activities));
+    setInterval(updateFreshness,60000);
 
     const svg = d3.select('#mapSvg');
     const mapGroup = svg.select('#mapGroup');
@@ -246,6 +284,7 @@
     const newsFeed = document.getElementById('newsFeed');
 
     const SC = {
+        developing: { css:'var(--text-muted)', glow:'', dot:'', },
         critical: { css:'var(--red-active)', glow:'url(#glow-red)', dot:'red' },
         elevated: { css:'var(--amber-active)', glow:'url(#glow-amber)', dot:'amber' },
         stable:   { css:'var(--green-active)', glow:'url(#glow-green)', dot:'green' },
@@ -330,25 +369,15 @@
         connectionsG.innerHTML = '';
         activityStrip.innerHTML = '';
 
-        // Connection lines
-        for (let i = 0; i < acts.length; i++) {
-            for (let j = i+1; j < acts.length; j++) {
-                const a = acts[i], b = acts[j];
-                if (haversineKm(a.lat,a.lng,b.lat,b.lng) < 2000 && (a.status !== 'stable' || b.status !== 'stable')) {
-                    const pA = latLngToXY(a.lat,a.lng), pB = latLngToXY(b.lat,b.lng);
-                    if (pA.x < 0 || pB.x < 0) continue;
-                    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
-                    line.setAttribute('x1',pA.x); line.setAttribute('y1',pA.y);
-                    line.setAttribute('x2',pB.x); line.setAttribute('y2',pB.y);
-                    line.setAttribute('class','connection-line');
-                    line.setAttribute('stroke', SC[a.status]?.css || 'var(--red-active)');
-                    connectionsG.appendChild(line);
-                }
-            }
-        }
+        const evidence=document.getElementById('evidenceFilter').value, category=document.getElementById('categoryFilter').value;
+        const expired=!latestEnvelope?.lastFetch || Date.now()-Date.parse(latestEnvelope.lastFetch)>20*60000 || latestEnvelope.health?.stale;
+        acts=acts.map(a=>expired || !a.newestEvidenceAt || Date.now()-Date.parse(a.newestEvidenceAt)>86400000 ? {...a,evidenceState:'developing',status:'developing'} : a)
+            .filter(a=>(evidence==='all' || a.evidenceState===evidence) && (category==='all' || a.type===category));
+        if (!acts.length) activityStrip.textContent='No '+(evidence==='all'?'current':evidence)+' situations for these filters.';
 
         // Dots
         acts.forEach((act, idx) => {
+            if (!projection || !Number.isFinite(act.lat) || !Number.isFinite(act.lng)) return;
             const {x, y} = latLngToXY(act.lat, act.lng);
             if (x < 0) return; // off-projection
             const sc = SC[act.status] || SC.stable;
@@ -357,6 +386,8 @@
             const g = document.createElementNS('http://www.w3.org/2000/svg','g');
             g.setAttribute('class', 'activity-dot dot-' + act.status);
             g.setAttribute('data-id', act.id);
+            g.setAttribute('aria-label',act.name+' '+act.evidenceState);
+            keyboardClick(g,()=>openPanel(act));
 
             if (isCrit || isElev) {
                 const outer = document.createElementNS('http://www.w3.org/2000/svg','circle');
@@ -368,12 +399,12 @@
                 g.appendChild(outer);
             }
 
-            const dotSize = act.confidence === 'low' ? (isCrit ? '2.5' : isElev ? '2' : '1.5') : (isCrit ? '4' : isElev ? '3' : '2.5');
+            const dotSize = act.evidenceState !== 'confirmed' ? (isCrit ? '2.5' : isElev ? '2' : '1.5') : (isCrit ? '4' : isElev ? '3' : '2.5');
             const inner = document.createElementNS('http://www.w3.org/2000/svg','circle');
             inner.setAttribute('cx',x); inner.setAttribute('cy',y); inner.setAttribute('r',dotSize);
             inner.setAttribute('fill',sc.css); inner.setAttribute('class','dot-inner');
             inner.setAttribute('filter',sc.glow);
-            if (act.confidence === 'low') inner.style.opacity = '0.5';
+            if (act.evidenceState !== 'confirmed') inner.style.opacity = '0.5';
             g.appendChild(inner);
 
             const hit = document.createElementNS('http://www.w3.org/2000/svg','circle');
@@ -392,9 +423,10 @@
         acts.forEach(act => {
             const sc = SC[act.status] || SC.stable;
             const el = document.createElement('div');
-            el.className = 'strip-item' + (act.confidence === 'low' ? ' low-confidence' : '');
-            el.innerHTML = '<span class="strip-dot '+sc.dot+'"></span><span>'+act.name+'</span><span class="strip-type">'+act.type+'</span><span class="strip-score">'+act.score+'</span>';
+            el.className = 'strip-item' + (act.evidenceState !== 'confirmed' ? ' low-confidence' : '');
+            el.innerHTML = '<span class="strip-dot '+sc.dot+'"></span><span>'+escapeHtml(act.name)+'</span><span class="strip-type">'+escapeHtml(act.type)+'</span><span class="strip-score">'+escapeHtml(act.score ?? 'unknown')+'</span>';
             el.addEventListener('click', () => openPanel(act));
+            keyboardClick(el,()=>openPanel(act));
             activityStrip.appendChild(el);
         });
 
@@ -415,8 +447,9 @@
             const el = document.createElement('div');
             el.className = 'news-item ' + (item.isBreaking ? 'breaking' : '');
             el.style.animationDelay = i * 0.05 + 's';
-            el.innerHTML = '<div class="news-item-meta"><span class="news-item-source">'+item.source+'</span><span class="news-item-dot">●</span><span class="news-item-time">'+(item.timeAgo||'')+'</span></div><div class="news-item-title">'+item.title+'</div>';
-            el.addEventListener('click', () => { if (item.link) window.open(item.link, '_blank'); });
+            el.innerHTML = '<div class="news-item-meta"><span class="news-item-source">'+escapeHtml(item.source)+'</span><span class="news-item-dot">●</span><span class="news-item-time">'+escapeHtml(evidenceAge(item.pubDate))+'</span></div><div class="news-item-title">'+escapeHtml(item.title)+'</div>';
+            el.addEventListener('click', () => { const url=safeLink(item.link); if (url) window.open(url, '_blank','noopener,noreferrer'); });
+            keyboardClick(el,()=>{const url=safeLink(item.link);if(url)window.open(url,'_blank','noopener,noreferrer');});
             frag.appendChild(el);
         });
         if (append) newsFeed.insertBefore(frag, newsFeed.firstChild); else newsFeed.appendChild(frag);
@@ -428,14 +461,14 @@
     // ═══════════════════════════════════════════════════
 
     function showCountryTooltip(event, name) {
-        tooltip.innerHTML = '<span style="color:var(--text-muted)">' + name + '</span>';
+        tooltip.innerHTML = '<span style="color:var(--text-muted)">' + escapeHtml(name) + '</span>';
         tooltip.classList.add('visible');
         moveTooltip(event);
     }
     function showActivityTooltip(event, act) {
         const sc = SC[act.status] || SC.stable;
-        const conf = act.confidence === 'low' ? ' · satellite only' : '';
-        tooltip.innerHTML = '<span class="tooltip-status" style="background:'+sc.css+'"></span>'+act.name+' · '+act.type+conf+'<span class="tooltip-score">'+act.score+'/10</span>';
+        const conf = act.evidenceState !== 'confirmed' ? ' · developing' : '';
+        tooltip.innerHTML = '<span class="tooltip-status" style="background:'+sc.css+'"></span>'+escapeHtml(act.name)+' · '+escapeHtml(act.type)+conf+'<span class="tooltip-score">'+escapeHtml(act.score ?? 'unknown')+'/10</span>';
         tooltip.classList.add('visible');
         moveTooltip(event);
     }
@@ -447,27 +480,32 @@
     // ═══════════════════════════════════════════════════
 
     function openPanel(act) {
-        const sc = SC[act.status] || SC.stable;
-        const arts = (act.topArticles||[]).map(a => '<a class="panel-article" href="'+a.url+'" target="_blank" rel="noopener"><div class="panel-article-title">'+a.title+'</div><div class="panel-article-meta">'+a.source+' · tone: '+(a.tone!=null?a.tone.toFixed(1):'n/a')+'</div></a>').join('');
-        const artsHtml = arts ? '<div class="panel-section"><div class="panel-section-label">Related Coverage</div><div class="panel-articles">'+arts+'</div></div>' : '';
-        const confBadge = act.confidence ? '<span class="confidence-badge '+act.confidence+'">'+act.confidence+'</span>' : '';
-        const confNote = act.confidence === 'low' ? '<div class="panel-confidence-note">Low confidence — based primarily on satellite geo-events. Score capped until confirmed by news sources.</div>' : '';
-
-        panelBody.innerHTML =
-            '<h2 class="panel-activity-name">'+act.name+'</h2>'+
-            '<div class="panel-badges"><div class="panel-status-badge '+act.status+'"><span class="badge-dot"></span>'+act.status.charAt(0).toUpperCase()+act.status.slice(1)+'</div><span class="panel-score-badge">'+act.score+' / 10</span>'+confBadge+'</div>'+
-            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Type</div><div class="panel-section-value">'+act.type+'</div></div><div class="panel-section"><div class="panel-section-label">Region</div><div class="panel-section-value">'+act.region+'</div></div></div>'+
-            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Articles (24h)</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+(act.articleCount||0)+'</div></div><div class="panel-section"><div class="panel-section-label">Source Diversity</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+(act.sourceDiversity||'—')+' unique sources</div></div></div>'+
-            '<div class="panel-meta-grid"><div class="panel-section"><div class="panel-section-label">Coordinates</div><div class="panel-section-value" style="font-family:var(--font-mono);font-size:12px">'+act.lat.toFixed(1)+'°'+(act.lat>=0?'N':'S')+', '+Math.abs(act.lng).toFixed(1)+'°'+(act.lng>=0?'E':'W')+'</div></div><div class="panel-section"><div class="panel-section-label">Classification</div><div class="panel-section-value" style="font-size:11px;color:var(--text-muted)">GDELT theme-classified</div></div></div>'+
-            confNote+
-            '<div class="panel-section"><div class="panel-section-label">Situation</div><div class="panel-section-value">'+act.description+'</div></div>'+
-            '<div class="panel-section"><div class="panel-section-label">Parties Involved</div><div class="panel-parties">'+act.parties.map(p=>'<span class="party-tag">'+p+'</span>').join('')+'</div></div>'+
-            artsHtml;
-        sidePanel.classList.add('open');
-        panelOverlay.classList.add('active');
+        selectedId=act.id;
+        panelBody.replaceChildren();
+        function node(tag,text,cls,parent=panelBody) { const el=document.createElement(tag);el.textContent=text;if(cls)el.className=cls;parent.appendChild(el);return el; }
+        node('h2',act.name,'panel-activity-name');
+        node('p',act.evidenceState.toUpperCase()+' · '+(act.score ?? 'Unknown')+' / 10 reported severity','panel-score-badge');
+        node('p','Provisional rubric; coverage and sentiment do not raise severity.','panel-confidence-note');
+        node('p',act.description,'panel-section-value');
+        node('p',act.articleCount+' distinct stories · '+act.sourceDiversity+' distinct reporting origins','panel-section');
+        node('p','Newest dated evidence: '+evidenceAge(act.newestEvidenceAt),'panel-section');
+        node('p','Location: '+act.region+' ('+act.locationPrecision+'). A mention is not a verified incident location.','panel-section');
+        if(Number.isFinite(act.lat)&&Number.isFinite(act.lng))node('p',Math.abs(act.lat).toFixed(1)+'°'+(act.lat>=0?'N':'S')+', '+Math.abs(act.lng).toFixed(1)+'°'+(act.lng>=0?'E':'W'),'panel-section');
+        node('p','Assessment: '+(act.explanation?.reasons || []).join(', '),'panel-section');
+        node('p','Pipeline: '+act.pipelineVersion,'panel-section');
+        node('h3','Supporting coverage','panel-section-label');
+        for(const a of act.topArticles || []) {
+            const section=node('div','','panel-section'); const url=safeLink(a.url);
+            const title=node(url?'a':'p',a.title,'panel-article-title',section);
+            if(url){title.href=url;title.target='_blank';title.rel='noopener noreferrer';}
+            node('p',a.source+' · '+evidenceAge(a.publishedAt),'panel-article-meta',section);
+            for(const evidence of a.classification?.evidence || [])node('blockquote',evidence.text,'panel-section-value',section);
+            node('p',(a.classification?.reasons || []).join(', '),'panel-article-meta',section);
+        }
+        sidePanel.classList.add('open'); panelOverlay.classList.add('active');
     }
 
-    function closePanel() { sidePanel.classList.remove('open'); panelOverlay.classList.remove('active'); }
+    function closePanel() { selectedId=null; sidePanel.classList.remove('open'); panelOverlay.classList.remove('active'); }
     document.getElementById('panelClose').addEventListener('click', closePanel);
     panelOverlay.addEventListener('click', closePanel);
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel(); });
@@ -479,8 +517,8 @@
     function updateClock() { const n = new Date(); document.getElementById('clock').textContent = String(n.getUTCHours()).padStart(2,'0')+':'+String(n.getUTCMinutes()).padStart(2,'0')+':'+String(n.getUTCSeconds()).padStart(2,'0')+' UTC'; }
     setInterval(updateClock, 1000); updateClock();
 
-    async function fetchActivities() { try { const r = await fetch(API_BASE+'/api/activities'); const d = await r.json(); activities = d.activities||[]; renderActivities(activities); updateSource(d.source==='live'?'LIVE':'BASELINE'); } catch(e) { console.error(e); updateSource('OFFLINE'); } }
-    async function fetchNews() { try { const r = await fetch(API_BASE+'/api/news'); const d = await r.json(); newsItems = d.news||[]; renderNews(newsItems); } catch(e) { console.error(e); } }
+    async function fetchActivities() { try { const r=await fetch(API_BASE+'/api/activities');if(!r.ok)throw new Error(r.status);applyEnvelope(await r.json()); } catch(e){updateSource('OFFLINE');} }
+    async function fetchNews() { try { const r=await fetch(API_BASE+'/api/news');if(!r.ok)throw new Error(r.status);const d=await r.json();newsItems=d.news||[];renderNews(newsItems); }catch(e){console.error(e);} }
     function updateSource(label) { const el = document.getElementById('dataSource'); document.getElementById('sourceLabel').textContent = label; el.classList.toggle('offline', label !== 'LIVE'); }
 
     function connectWebSocket() {
@@ -488,9 +526,9 @@
             ws = new WebSocket(WS_URL);
             ws.onopen = () => { wsConnected = true; console.log('[ws] Connected'); };
             ws.onmessage = e => { try { const m = JSON.parse(e.data);
-                if (m.type==='init') { activities = m.activities||[]; renderActivities(activities); if (m.news?.length) { newsItems = m.news; renderNews(newsItems); } updateSource('LIVE'); }
-                if (m.type==='activities_update') { activities = m.activities||[]; renderActivities(activities); updateSource('LIVE'); }
-                if (m.type==='news_update') { const n = m.items||[]; if (n.length) { newsItems = [...n,...newsItems].slice(0,50); renderNews(n, true); } }
+                if (m.type==='init') { applyEnvelope(m); if (m.news?.length) { newsItems = m.news; renderNews(newsItems); } }
+                if (m.type==='activities_update') applyEnvelope(m);
+                if (m.type==='news_update') {newsItems=m.items||[];renderNews(newsItems);}
                 if (m.type==='escalation') (m.escalations||[]).forEach(handleEscalation);
             } catch {} };
             ws.onclose = () => { wsConnected = false; updateSource('RECONNECTING'); setTimeout(connectWebSocket, 5000); };
@@ -513,6 +551,7 @@
     document.getElementById('notifClear').addEventListener('click', e => { e.stopPropagation(); escalationHistory=[]; unreadCount=0; notifBadge.classList.remove('visible'); notifList.innerHTML='<div class="notif-empty">No escalations yet</div>'; });
 
     function handleEscalation(esc) {
+        if(escalationHistory.some(e=>e.id===esc.id))return;
         escalationHistory.unshift(esc);
         if (escalationHistory.length > 20) escalationHistory.pop();
         unreadCount++;
@@ -524,15 +563,15 @@
         // Alert sound
         try { const ctx = new (window.AudioContext||window.webkitAudioContext)(); const now = ctx.currentTime; [0,.15].forEach((d,i)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.type='sine';o.frequency.value=i?660:440;g.gain.setValueAtTime(.15,now+d);g.gain.exponentialRampToValueAtTime(.001,now+d+.25);o.start(now+d);o.stop(now+d+.3)}); } catch{}
         renderEscalations();
-        if (Notification.permission === 'granted') new Notification('ESCALATION: '+esc.name, { body: esc.from+' → '+esc.to+' ('+esc.score+')', tag: 'esc-'+esc.name });
-        else if (Notification.permission !== 'denied') Notification.requestPermission();
+        if ('Notification' in window && Notification.permission === 'granted') new Notification('ESCALATION: '+esc.name, { body: esc.from+' → '+esc.to+' ('+esc.score+')', tag: 'esc-'+esc.name });
+
     }
 
     function renderEscalations() {
         if (!escalationHistory.length) { notifList.innerHTML='<div class="notif-empty">No escalations yet</div>'; return; }
         notifList.innerHTML = escalationHistory.map(e => {
             const t = new Date(e.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-            return '<div class="notif-item"><div class="notif-item-header"><span class="notif-item-name">'+e.name+'</span><span class="notif-item-time">'+t+'</span></div><div class="notif-item-escalation"><span class="notif-status '+e.from+'">'+e.from+'</span><span class="notif-arrow">→</span><span class="notif-status '+e.to+'">'+e.to+'</span><span style="margin-left:auto;font-size:9px;color:var(--text-muted)">'+e.score+'</span></div></div>';
+            return '<div class="notif-item"><div class="notif-item-header"><span class="notif-item-name">'+escapeHtml(e.name)+'</span><span class="notif-item-time">'+t+'</span></div><div class="notif-item-escalation"><span class="notif-status '+escapeHtml(e.from)+'">'+escapeHtml(e.from)+'</span><span class="notif-arrow">→</span><span class="notif-status '+escapeHtml(e.to)+'">'+escapeHtml(e.to)+'</span><span style="margin-left:auto;font-size:9px;color:var(--text-muted)">'+escapeHtml(e.score)+'</span></div></div>';
         }).join('');
     }
 
@@ -541,6 +580,7 @@
     // ═══════════════════════════════════════════════════
 
     drawMap().then(() => {
+        fetch('/api/escalations').then(r=>r.json()).then(d=>{escalationHistory=d.escalations||[];renderEscalations();}).catch(()=>{});
         fetchActivities();
         fetchNews();
         connectWebSocket();
@@ -549,13 +589,14 @@
     }).catch(err => {
         console.error('[map] Failed to load:', err);
         document.getElementById('mapLoading').textContent = 'Map failed to load. Check network.';
-        // Still start data fetching
+        // Keep list, panels, and polling usable if the map is unavailable.
+        setInterval(fetchActivities,60000);setInterval(fetchNews,300000);
         fetchActivities();
         fetchNews();
         connectWebSocket();
     });
 
-    document.addEventListener('click', () => { if (Notification.permission === 'default') Notification.requestPermission(); }, { once: true });
+    document.getElementById('enableNotifications').addEventListener('click',()=>{if('Notification' in window)Notification.requestPermission();});
     </script>
 </body>
 </html>

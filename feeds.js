@@ -6,7 +6,7 @@
  */
 
 const RSSParser = require('rss-parser');
-const Sentiment = require('sentiment');
+
 
 const parser = new RSSParser({
     timeout: 15000,
@@ -15,7 +15,7 @@ const parser = new RSSParser({
         'Accept': 'application/rss+xml, application/xml, text/xml, */*',
     },
 });
-const sentiment = new Sentiment();
+
 
 // ═══════════════════════════════════════════════════════
 // FEED SOURCES — verified working as of 2025
@@ -45,11 +45,6 @@ const FEEDS = [
 // SENTIMENT
 // ═══════════════════════════════════════════════════════
 
-function analyzeTone(text) {
-    const result = sentiment.analyze(text);
-    return Math.round(Math.max(-10, Math.min(10, result.score * 2)) * 10) / 10;
-}
-
 // ═══════════════════════════════════════════════════════
 // FETCH ALL FEEDS
 // ═══════════════════════════════════════════════════════
@@ -68,9 +63,10 @@ async function fetchAllNews() {
                     title,
                     link: item.link || '',
                     source: feed.name,
-                    pubDate: item.pubDate ? new Date(item.pubDate) : new Date(),
+                    pubDate: require('./pipeline').validDate(item.isoDate || item.pubDate),
+                    language: 'English',
                     snippet: cleanTitle(item.contentSnippet || item.content || ''),
-                    tone: analyzeTone(title),
+
                 };
             });
             results.success++;
@@ -99,11 +95,11 @@ async function fetchAllNews() {
         console.log(`[feeds] All ${FEEDS.length} feeds fetched OK`);
     }
 
-    const deduped = deduplicateByTitle(allItems);
-    deduped.sort((a, b) => b.pubDate - a.pubDate);
-    deduped.forEach(item => { item.timeAgo = timeAgo(item.pubDate); });
+    const deduped = allItems; // canonical cross-provider deduplication happens in pipeline.js
+    deduped.sort((a, b) => Date.parse(b.pubDate || 0) - Date.parse(a.pubDate || 0));
+    deduped.forEach(item => { item.timeAgo = item.pubDate ? timeAgo(new Date(item.pubDate)) : 'date unknown'; });
 
-    return deduped;
+    return { items: deduped, health: results };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -132,4 +128,4 @@ function timeAgo(date) {
     return `${Math.floor(s / 86400)}d ago`;
 }
 
-module.exports = { fetchAllNews, FEEDS, analyzeTone };
+module.exports = { fetchAllNews, FEEDS };

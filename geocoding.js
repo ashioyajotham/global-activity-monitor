@@ -49,6 +49,8 @@ let _budgetDay = new Date().toISOString().slice(0, 10);
 
 function _checkBudgetReset() {
     const today = new Date().toISOString().slice(0, 10);
+    const saved = db.getState('geocodeBudget', null);
+    if (saved?.day === today) _callsToday = Math.max(_callsToday, saved.calls);
     if (today !== _budgetDay) {
         _budgetDay = today;
         _callsToday = 0;
@@ -68,7 +70,7 @@ function normalizeQuery(placeName, countryName) {
  * isn't available/successful — callers should fall back to the country
  * centroid in that case.
  */
-async function geocodePlace(placeName, countryName) {
+async function geocodePlace(placeName, countryName, countryCode) {
     if (!API_KEY) return null;
     if (!placeName || !countryName) return null;
 
@@ -91,20 +93,20 @@ async function geocodePlace(placeName, countryName) {
         return null;
     }
 
-    const promise = _fetchGeocode(query).finally(() => _inFlight.delete(query));
+    const promise = _fetchGeocode(query, countryCode).finally(() => _inFlight.delete(query));
     _inFlight.set(query, promise);
     return promise;
 }
 
-async function _fetchGeocode(query) {
+async function _fetchGeocode(query, countryCode) {
     _callsToday++;
-    const url = `${GEOCODE_URL}?address=${encodeURIComponent(query)}&key=${API_KEY}`;
+    db.setState('geocodeBudget', {day:_budgetDay,calls:_callsToday});
+    const url = `${GEOCODE_URL}?address=${encodeURIComponent(query)}&key=${API_KEY}${countryCode ? '&components=country:'+encodeURIComponent(countryCode) : ''}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
 
     try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 5000);
         const res = await fetch(url, { signal: controller.signal });
-        clearTimeout(timer);
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -113,17 +115,19 @@ async function _fetchGeocode(query) {
             console.error(`[geocoding] API error for "${query}": ${data.status} — ${data.error_message || ''}`);
             // Don't cache hard API-level failures — they're not "no such place",
             // they're "we can't ask right now", so retry is legitimate later.
-            _memCache.set(query, null);
             return null;
         }
 
-        if (data.status !== 'OK' || !data.results?.length) {
+        if (data.status === 'ZERO_RESULTS') {
             db.setCachedGeocode(query, null);
             _memCache.set(query, null);
             return null;
         }
 
+        if (data.status !== 'OK' || !data.results?.length) return null;
         const top = data.results[0];
+        const foundCountry = top.address_components?.find(c=>c.types?.includes('country'))?.short_name;
+        if (top.partial_match || (countryCode && foundCountry !== countryCode)) return null;
         const result = {
             lat: top.geometry.location.lat,
             lng: top.geometry.location.lng,
@@ -135,9 +139,8 @@ async function _fetchGeocode(query) {
     } catch (e) {
         console.error(`[geocoding] Lookup failed for "${query}": ${e.message}`);
         // Network hiccups shouldn't be cached as permanent misses.
-        _memCache.set(query, null);
         return null;
-    }
+    } finally { clearTimeout(timer); }
 }
 
 function isEnabled() {

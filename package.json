@@ -1,23 +1,27 @@
 {
   "name": "global-activity-monitor",
-  "version": "4.1.0",
-  "description": "Autonomous world activity tracker — GDELT theme-classified events, Natural Earth map, SQLite persistence",
+  "version": "5.0.0",
+  "description": "Evidence-backed news monitor with provisional severity and reviewed local classification",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "cleanup": "node -e \"require('./db').init(); require('./db').cleanup(30); require('./db').close();\""
+    "cleanup": "node -e \"require('./db').init(); require('./db').cleanup(30); require('./db').close();\"",
+    "test": "node --test tests/*.test.js",
+    "replay": "node scripts/replay.js",
+    "model:parity": "node scripts/model-parity.js",
+    "model:promote": "node scripts/promote-model.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
-    "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "node-cron": "^3.0.3",
+    "better-sqlite3": "13.0.3",
+    "express": "4.22.1",
     "rss-parser": "^3.13.0",
-    "sentiment": "^5.0.2",
-    "ws": "^8.18.0"
+    "ws": "8.21.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22"
+  },
+  "overrides": {
+    "qs": "6.16.0"
   }
 }
