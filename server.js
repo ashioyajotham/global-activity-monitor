@@ -191,6 +191,7 @@ function createApp({ fetchGdeltImpl = fetchGdelt, fetchNewsImpl = fetchAllNews, 
     app.get('/api/trends',(_,res) => res.json({pipelineVersion:VERSION,trends:latest.situations.map(s => ({id:s.id,name:s.name,points:db.getTrend(s.id,1)}))}));
     app.get('/api/trends/:id',(req,res) => res.json({id:req.params.id,pipelineVersion:VERSION,trend:db.getTrend(req.params.id,positive(req.query.days,7,30))}));
     app.get('/api/escalations',(req,res) => res.json({escalations:db.getAlerts(positive(req.query.limit,50,200))}));
+    app.get('/api/review/stats',reviewAccess,(_,res) => res.json(db.reviewStats()));
     app.get('/api/review',reviewAccess,(req,res) => res.json({items:db.reviewQueue(positive(req.query.limit,25,100),Math.max(0,Number(req.query.offset)||0),req.query.reviewed === 'true')}));
     app.get('/api/review/export',reviewAccess,(_,res) => res.json({pipelineVersion:VERSION,items:db.exportLabels()}));
     app.post('/api/review/:id',reviewAccess,(req,res,next) => { try { res.json(db.saveLabel(req.params.id,req.body.label,req.body.revision)); } catch(error) { next(error); } });

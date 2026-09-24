@@ -18,6 +18,7 @@ test('additive migration preserves legacy data; empty cycles, labels, relationsh
     assert.equal(db.saveLabel(row.article.id,label,0).revision,1);
     assert.throws(()=>db.saveLabel(row.article.id,label,0),/changed/);
     assert.equal(db.exportLabels().length,1);
+    const reviewStats=db.reviewStats();assert.equal(reviewStats.reviewed,1);assert.equal(reviewStats.progress.totalReviewed.value,1);
     db.storeCycle({articles:[],situations:[],pipelineVersion:VERSION},{status:'ok'},{},[],now);
     assert.deepEqual(db.getState('latest').situations,[]);assert.equal(native.prepare('SELECT score FROM situation_snapshots').get().score,10);db.close();
 });

@@ -9,6 +9,7 @@
     "cleanup": "node -e \"require('./db').init(); require('./db').cleanup(30); require('./db').close();\"",
     "test": "node --test tests/*.test.js",
     "replay": "node scripts/replay.js",
+    "review:freeze": "node scripts/freeze-review.js",
     "model:parity": "node scripts/model-parity.js",
     "model:promote": "node scripts/promote-model.js"
   },

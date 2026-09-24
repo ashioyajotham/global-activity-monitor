@@ -1,6 +1,6 @@
 'use strict';
 let offset=0;
-const queue=document.getElementById('queue'),status=document.getElementById('status');
+const queue=document.getElementById('queue'),status=document.getElementById('status'),progress=document.getElementById('progress');
 function element(tag,text,parent){const el=document.createElement(tag);el.textContent=text;parent.appendChild(el);return el;}
 function field(parent,name,value,options){const label=element('label',name,parent);const el=document.createElement(options?'select':name==='Notes'||name==='Supporting excerpt'?'textarea':'input');if(options)for(const option of options)el.add(new Option(option,option));el.value=value??'';label.appendChild(el);return el;}
 async function load(){
@@ -31,11 +31,18 @@ async function load(){
             try{
                 const result=await fetch('/api/review/'+a.id,{method:'POST',headers:{'Content-Type':'application/json','X-Review-Request':'1'},body:JSON.stringify({revision:row.revision,label:{relevance:relevance.value,category:category.value,score:score.value==='unknown'?null:Number(score.value),slice:slice.value,storyId:storyId.value.trim(),location:location.value.trim(),evidence:evidence.value.trim(),notes:notes.value.trim()}})});
                 const body=await result.json();if(!result.ok)throw new Error(body.error);row.revision=body.revision;feedback.textContent='Saved revision '+body.revision;
-            }catch(error){feedback.textContent=error.message;}finally{save.disabled=false;}
+            }catch(error){feedback.textContent=error.message;}finally{save.disabled=false;loadStats();}
         });
     }
+}
+async function loadStats(){
+    try{
+        const response=await fetch('/api/review/stats');if(!response.ok)throw new Error(response.status);
+        const data=await response.json(),p=data.progress;
+        progress.textContent=`Reviewed ${data.reviewed}/${data.total} · relevant ${p.relevant.value}/${p.relevant.target} · irrelevant ${p.irrelevant.value}/${p.irrelevant.target} · sports ${p['routine-sports'].value}/${p['routine-sports'].target} · event ${p.event.value}/${p.event.target}`;
+    }catch(error){progress.textContent='Review progress unavailable: '+error.message;}
 }
 document.getElementById('reviewed').addEventListener('change',()=>{offset=0;load().catch(e=>status.textContent=e.message);});
 document.getElementById('next').addEventListener('click',()=>{if(document.getElementById('reviewed').checked)offset+=25;else offset=0;load().catch(e=>status.textContent=e.message);});
 document.getElementById('export').addEventListener('click',async()=>{try{const r=await fetch('/api/review/export');if(!r.ok)throw new Error('Export failed');const data=await r.json();const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='reviewed-labels.json';a.click();URL.revokeObjectURL(url);}catch(e){status.textContent=e.message;}});
-load().catch(e=>status.textContent=e.message);
+Promise.all([load(),loadStats()]).catch(e=>status.textContent=e.message);

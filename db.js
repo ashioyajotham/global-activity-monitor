@@ -68,6 +68,24 @@ function reviewQueue(limit = 25, offset = 0, reviewed = false) {
         WHERE ${reviewed ? 'l.article_id IS NOT NULL' : 'l.article_id IS NULL'} ORDER BY a.first_seen,a.id LIMIT ? OFFSET ?`).all(limit, offset)
         .map(r => ({ article: JSON.parse(r.data), label: r.label ? JSON.parse(r.label) : null, revision: r.revision || 0 }));
 }
+function reviewStats() {
+    const total = db.prepare('SELECT count(*) n FROM evidence_articles').get().n;
+    const reviewed = db.prepare('SELECT count(*) n FROM review_labels').get().n;
+    const rows = db.prepare('SELECT label FROM review_labels').all().map(row => JSON.parse(row.label));
+    const counts = { relevance:{relevant:0,irrelevant:0,uncertain:0}, slices:{}, categories:{}, severity:{unknown:0,2:0,5:0,8:0,10:0} };
+    for (const label of rows) {
+        counts.relevance[label.relevance] = (counts.relevance[label.relevance] || 0) + 1;
+        counts.slices[label.slice] = (counts.slices[label.slice] || 0) + 1;
+        counts.categories[label.category] = (counts.categories[label.category] || 0) + 1;
+        counts.severity[label.score == null ? 'unknown' : String(label.score)] = (counts.severity[label.score == null ? 'unknown' : String(label.score)] || 0) + 1;
+    }
+    const targets = { totalReviewed:1000, relevant:300, irrelevant:300, uncertain:100, event:100, 'routine-sports':300 };
+    const progress = Object.fromEntries(Object.entries(targets).map(([key,target]) => {
+        const value = key === 'totalReviewed' ? reviewed : key === 'relevant' || key === 'irrelevant' || key === 'uncertain' ? counts.relevance[key] : counts.slices[key] || 0;
+        return [key,{value,target,remaining:Math.max(0,target-value),complete:value >= target}];
+    }));
+    return { total, reviewed, unreviewed:Math.max(0,total-reviewed), counts, progress };
+}
 const CATEGORIES = ['Armed Conflict','Military Operations','Civil Unrest','Humanitarian Crisis','Disaster','Diplomacy','Unclassified'];
 function saveLabel(id, label, expectedRevision) {
     if (!label || !['relevant','irrelevant','uncertain'].includes(label.relevance) || !CATEGORIES.includes(label.category) ||
@@ -113,4 +131,4 @@ function cleanup(days = 30) {
 }
 function close() { if (db) { db.close(); db = null; } }
 module.exports = { init, close, getState, setState, storeCycle, getTrend, getAlerts, reviewQueue, saveLabel, exportLabels,
-    recordModel, recordShadow, shadowReport, getCachedGeocode, setCachedGeocode, getStats, cleanup, CATEGORIES };
+    reviewStats, recordModel, recordShadow, shadowReport, getCachedGeocode, setCachedGeocode, getStats, cleanup, CATEGORIES };
