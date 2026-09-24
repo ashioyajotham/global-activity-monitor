@@ -9,6 +9,7 @@ function init(filename = process.env.DB_PATH || path.join(__dirname, 'monitor.db
     db.exec(`
         CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS evidence_runs(id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, version TEXT NOT NULL, health TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS provider_responses(run_id INTEGER NOT NULL REFERENCES evidence_runs(id), provider_id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(run_id,provider_id));
         CREATE TABLE IF NOT EXISTS evidence_articles(id TEXT PRIMARY KEY, data TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS evidence_snapshots(run_id INTEGER NOT NULL REFERENCES evidence_runs(id), situation_id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(run_id,situation_id));
         CREATE TABLE IF NOT EXISTS evidence_links(run_id INTEGER NOT NULL, situation_id TEXT NOT NULL, article_id TEXT NOT NULL, PRIMARY KEY(run_id,situation_id,article_id));
@@ -26,7 +27,7 @@ function init(filename = process.env.DB_PATH || path.join(__dirname, 'monitor.db
     for (const table of ['review_labels','review_history']) {
         if (!db.prepare(`PRAGMA table_info(${table})`).all().some(column=>column.name==='article_data')) db.exec(`ALTER TABLE ${table} ADD COLUMN article_data TEXT`);
     }
-    db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES(2,datetime('now'))").run();
+    db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES(3,datetime('now'))").run();
     return db;
 }
 function getState(key, fallback = null) {
@@ -34,10 +35,12 @@ function getState(key, fallback = null) {
     return row ? JSON.parse(row.data) : fallback;
 }
 function setState(key, value) { db.prepare('INSERT INTO evidence_state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key, JSON.stringify(value)); }
-function storeCycle({ articles, situations, pipelineVersion }, health, alertState, alerts, now) {
+function storeCycle({ articles, situations, pipelineVersion }, health, alertState, alerts, now, providerResponses = []) {
     return db.transaction(() => {
         const run = db.prepare('INSERT INTO evidence_runs(recorded_at,version,health) VALUES(?,?,?)').run(now, pipelineVersion, JSON.stringify(health));
         const runId = Number(run.lastInsertRowid);
+        const providerInsert = db.prepare('INSERT INTO provider_responses(run_id,provider_id,data) VALUES(?,?,?)');
+        for (const response of providerResponses) providerInsert.run(runId, response.id, JSON.stringify(response));
         const articleInsert = db.prepare('INSERT INTO evidence_articles VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,last_seen=excluded.last_seen');
         for (const a of articles) articleInsert.run(a.id, JSON.stringify(a), now, now);
         const snap = db.prepare('INSERT INTO evidence_snapshots VALUES(?,?,?)');
@@ -98,7 +101,7 @@ function shadowReport(modelHash) {
 }
 function getCachedGeocode(query) { const r = db.prepare('SELECT * FROM geocode_cache WHERE query=?').get(query); return r ? { lat:r.lat, lng:r.lng, formattedAddress:r.formatted_address, found:!!r.found } : undefined; }
 function setCachedGeocode(query, result) { db.prepare('INSERT INTO geocode_cache(query,lat,lng,formatted_address,found) VALUES(?,?,?,?,?) ON CONFLICT(query) DO UPDATE SET lat=excluded.lat,lng=excluded.lng,formatted_address=excluded.formatted_address,found=excluded.found').run(query,result?.lat??null,result?.lng??null,result?.formattedAddress??null,result?1:0); }
-function getStats() { return { snapshots: db.prepare('SELECT count(*) n FROM evidence_snapshots').get().n, articles: db.prepare('SELECT count(*) n FROM evidence_articles').get().n, reviewed: db.prepare('SELECT count(*) n FROM review_labels').get().n, escalations: db.prepare('SELECT count(*) n FROM evidence_alerts').get().n, schemaVersion: 2 }; }
+function getStats() { return { snapshots: db.prepare('SELECT count(*) n FROM evidence_snapshots').get().n, articles: db.prepare('SELECT count(*) n FROM evidence_articles').get().n, providerResponses: db.prepare('SELECT count(*) n FROM provider_responses').get().n, reviewed: db.prepare('SELECT count(*) n FROM review_labels').get().n, escalations: db.prepare('SELECT count(*) n FROM evidence_alerts').get().n, schemaVersion: 3 }; }
 function cleanup(days = 30) {
     db.transaction(() => {
         db.prepare(`DELETE FROM evidence_links WHERE run_id IN (SELECT id FROM evidence_runs WHERE julianday(recorded_at)<julianday('now',?))`).run(`-${days} days`);

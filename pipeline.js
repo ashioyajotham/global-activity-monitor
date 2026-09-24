@@ -36,13 +36,44 @@ function publisherGroup(host) {
     const compound=new Set(['co.uk','com.au','co.za','co.ke','co.in','com.br','com.cn','co.jp','co.nz']);
     return parts.slice(compound.has(suffix)?-3:-2).join('.');
 }
+function extractEventFrame(title, snippet, countries) {
+    const text = `${title}. ${snippet}`;
+    const action = text.match(/\b(attacks?|attacked|strikes?|struck|invades?|invaded|bomb(?:ed|ing)?|shell(?:ed|ing)?|airstrikes?|clashes?|fights?|killed|kill|deaths?|casualties|evacuat\w*|flood(?:s|ing)?|earthquake|wildfire|famine|protests?|riots?|sanctions?)\b/i);
+    const impact = text.match(/\b(\d{1,6}|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:people\s+)?(?:killed|dead|deaths?|injured|wounded|missing|displaced|evacuated)\b/i)
+        || text.match(/\b(?:kill|kills|killed)\s+(\d{1,6}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i)
+        || text.match(/\b(mass casualties|mass displacement|widespread devastation|mass evacuation|state of emergency|humanitarian catastrophe)\b/i);
+    const explicit = text.match(/\b(?:in|near|around|from|across)\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,2})/);
+    let locationCode = null;
+    const target = text.match(/\b(?:attacks?|strikes?|invades?|invaded|bombs?|shells?)\s+(?:on\s+)?([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,2})/i);
+    if (target) {
+        const match = extractCountries(target[1])[0];
+        if (match) locationCode = match.code;
+    }
+    if (explicit) {
+        const match = extractCountries(explicit[1])[0];
+        if (match) locationCode = match.code;
+    }
+    if (!locationCode && countries.length === 1) locationCode = countries[0].code;
+    // For a two-country action headline, the second country is the reported target
+    // unless an explicit location phrase gives a better answer.
+    if (!locationCode && countries.length >= 2 && /\b(attacks?|strikes?|invades?|bomb|shell|clashes?|killed|casualties)\b/i.test(text)) {
+        locationCode = countries.at(-1).code;
+    }
+    return {
+        action: action?.[0]?.toLowerCase() || null,
+        impact: impact?.[0] || null,
+        locationCode,
+        evidence: [action?.[0], impact?.[0]].filter(Boolean),
+    };
+}
 function normalizeArticle(raw, now = new Date().toISOString()) {
     const title = clean(raw.title || raw.name), snippet = clean(raw.snippet);
     const url = canonicalUrl(raw.url || raw.link);
     let publisher = 'unknown';
     if (url) publisher = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
     const countries = extractCountries(`${title} ${snippet}`);
-    const candidate = countries.length === 1 ? countries[0] : null;
+    const frame = extractEventFrame(title, snippet, countries);
+    const candidate = countries.find(c => c.code === frame.locationCode) || null;
     // A mention is a location candidate, not a verified incident location.
     const specific = candidate && candidate.specificity > 1;
     const validCoords = Number.isFinite(raw.lat) && Number.isFinite(raw.lng) && Math.abs(raw.lat) <= 90 && Math.abs(raw.lng) <= 180;
@@ -53,6 +84,7 @@ function normalizeArticle(raw, now = new Date().toISOString()) {
         ingestedAt: now, provenance: [raw._isGdelt ? 'gdelt-geo' : raw._isDoc ? 'gdelt-doc' : 'rss'],
         retrievalThemes: raw._themeId ? [raw._themeId] : [],
         geoOnly: !!raw._isGdelt, countries: countries.map(c => c.code).sort(),
+        eventFrame: frame,
         location: candidate ? {
             country: candidate.code, name: specific ? candidate.matchedTerm : candidate.name,
             lat: specific && raw._geocoded && validCoords ? raw.lat : candidate.lat,
@@ -68,10 +100,13 @@ const patterns = {
     opinion: /\b(opinion|editorial|could|might|hypothetical|simulation|exercise|film|novel)\b/i,
 };
 const RULES = [
+    ['Armed Conflict', 8, /\b(attacks?|strikes?|invades?|invaded|bombed|shell(?:ed|ing)?)\b[^.!?]{0,70}\b(?:\d{1,6}|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:people\s+)?(?:killed|dead|deaths?|injured|wounded)\b/i],
+    ['Armed Conflict', 8, /\b(attacks?|strikes?|invades?|invaded|bombed|shell(?:ed|ing)?)\b[^.!?]{0,70}\b(?:kill|kills|killed)\s+(?:\d{1,6}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i],
+    ['Armed Conflict', 8, /\b(\d{1,6})\s+(?:people\s+)?(?:killed|dead|deaths?|injured|wounded)\b[^.!?]{0,70}\b(attacks?|strikes?|invades?|invaded|bombed|shell(?:ed|ing)?)\b/i],
     ['Humanitarian Crisis', 8, /\b(famine (?:declared|confirmed)|widespread starvation|mass displacement|humanitarian catastrophe)\b/i],
     ['Armed Conflict', 8, /\b(full.scale invasion|sustained (?:airstrikes|shelling|bombardment)|massacre|mass casualties)\b/i],
     ['Disaster', 8, /\b(catastrophic (?:flooding|earthquake|wildfire)|widespread devastation)\b/i],
-    ['Armed Conflict', 5, /\b(airstrikes?|shelling|bombing|armed clashes|gunfire|missile (?:attack|strike)|troops (?:invade|invaded)|bomb (?:attack|explodes|exploded))\b/i],
+    ['Armed Conflict', 5, /\b(attack(?:s|ed)?|airstrikes?|shelling|bombing|armed clashes|gunfire|missile (?:attack|strike)|troops (?:invade|invaded)|bomb (?:attack|explodes|exploded))\b/i],
     ['Disaster', 5, /\b(earthquake|tsunami|wildfire|flooding|floods?|mass evacuation|state of emergency)\b/i],
     ['Humanitarian Crisis', 5, /\b(refugees?|displaced|displacement|famine|humanitarian (?:crisis|emergency))\b/i],
     ['Civil Unrest', 5, /\b(violent (?:protests|clashes)|riots?|military coup|coup attempt)\b/i],
@@ -138,7 +173,9 @@ function compatible(a, b) {
     return a.classification.category === b.classification.category &&
         a.location?.country === b.location?.country && !!a.location &&
         // Distinct named locations must not collapse to a capital's coordinates.
-        (a.location.name === b.location.name) && similarity(a.title, b.title) >= 0.55;
+        (a.location.name === b.location.name) &&
+        (similarity(a.title, b.title) >= 0.55 ||
+            (a.eventFrame?.impact && b.eventFrame?.impact && a.classification.category === 'Armed Conflict'));
 }
 function buildSituations(articles, previous, now) {
     const groups = [];

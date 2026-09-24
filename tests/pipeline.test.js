@@ -16,6 +16,19 @@ test('football is excluded on every ingestion path, regardless of query tags and
 test('final flood warning is retained and a stadium emergency remains relevant',()=>{
     for(const title of ['Kenya declares state of emergency after final flood warning','France football stadium evacuated after bomb exploded'])assert.equal(run([article(title)]).articles[0].classification.relevance,'relevant');
 });
+test('cross-country attack reports get a target country and impact evidence',()=>{
+    const result=run([article('Russia attacks Ukraine kill six')]);
+    assert.equal(result.articles[0].classification.relevance,'relevant');
+    assert.equal(result.articles[0].classification.category,'Armed Conflict');
+    assert.equal(result.articles[0].classification.score,8);
+    assert.equal(result.articles[0].location.country,'UA');
+    assert.equal(result.situations[0].locationPrecision,'country-approximate');
+});
+test('two independent country-level attack reports can confirm without a city',()=>{
+    const result=run([article('Russia attacks Ukraine kill six','bbc.co.uk'),article('Russian strikes in Ukraine leave six dead','dw.com')]);
+    assert.equal(result.situations[0].evidenceState,'confirmed');
+    assert.equal(result.situations[0].locationPrecision,'country-approximate');
+});
 test('duplicates and syndicated copies cannot confirm or raise severity',()=>{
     const base=run([floodA()]);
     const repeated=run(Array.from({length:50},()=>floodA()));

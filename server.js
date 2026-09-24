@@ -10,7 +10,7 @@ try {
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('node:http');
-const { timingSafeEqual } = require('node:crypto');
+const { timingSafeEqual, createHash } = require('node:crypto');
 const { fetchAllNews } = require('./feeds');
 const { THEME_GROUPS, buildGeoQuery, buildDocQuery, parseGeoResponse, parseDocResponse } = require('./discovery');
 const { runPipeline, advanceAlerts, VERSION, WINDOW_MS, classify, normalizeArticle } = require('./pipeline');
@@ -34,24 +34,50 @@ async function fetchJson(url, timeout = 25000) {
     const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), timeout);
     try {
         const response = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'GlobalActivityMonitor/5.0' } });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`);
+            error.status = response.status;
+            throw error;
+        }
         return await response.json(); // deadline covers the response body too
     } finally { clearTimeout(timer); }
 }
+async function fetchGdeltRequest(url, maxAttempts = 3) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const data = await fetchJson(url);
+            return { data, attempts: attempt, responseHash: createHash('sha256').update(JSON.stringify(data)).digest('hex') };
+        } catch (error) {
+            lastError = error;
+            if (error.status !== 429 || attempt === maxAttempts) break;
+            const delay = Math.min(30000, 6000 * 2 ** (attempt - 1));
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    throw lastError;
+}
 async function fetchGdelt() {
-    const events = [], sources = [];
+    const events = [], sources = [], providerResponses = [];
     const requests = THEME_GROUPS.flatMap(theme => [{ theme, kind: 'geo' }, { theme, kind: 'doc' }]);
     for (let i = 0; i < requests.length; i++) {
         const { theme, kind } = requests[i];
         try {
-            const data = await fetchJson(kind === 'geo' ? buildGeoQuery(theme.geoQuery) : buildDocQuery(theme.docQuery));
+            const requestUrl = kind === 'geo' ? buildGeoQuery(theme.geoQuery) : buildDocQuery(theme.docQuery);
+            const response = await fetchGdeltRequest(requestUrl);
+            const data = response.data;
             if (kind === 'geo' ? !Array.isArray(data.features) : !Array.isArray(data.articles)) throw new Error('Unexpected response schema');
             const parsed = kind === 'geo' ? parseGeoResponse(data,theme) : parseDocResponse(data,theme);
-            events.push(...parsed); sources.push({ id: `${kind}:${theme.id}`, status:'ok', count:parsed.length });
-        } catch (error) { sources.push({ id:`${kind}:${theme.id}`, status:'failed', error: error.name === 'AbortError' ? 'timeout' : error.message }); }
+            events.push(...parsed); sources.push({ id: `${kind}:${theme.id}`, status:'ok', count:parsed.length, attempts:response.attempts });
+            providerResponses.push({ id:`${kind}:${theme.id}`, url:requestUrl, status:'ok', count:parsed.length, attempts:response.attempts, responseHash:response.responseHash });
+        } catch (error) {
+            const status = error.status === 429 ? 'rate-limited' : error.name === 'AbortError' ? 'timeout' : 'failed';
+            sources.push({ id:`${kind}:${theme.id}`, status, error: error.message });
+            providerResponses.push({ id:`${kind}:${theme.id}`, url:kind === 'geo' ? buildGeoQuery(theme.geoQuery) : buildDocQuery(theme.docQuery), status, error:error.message });
+        }
         if (i < requests.length - 1) await new Promise(resolve => setTimeout(resolve,5500));
     }
-    return { events, sources };
+    return { events, sources, providerResponses };
 }
 function createApp({ fetchGdeltImpl = fetchGdelt, fetchNewsImpl = fetchAllNews, now = () => new Date().toISOString() } = {}) {
     const app = express();
@@ -116,12 +142,13 @@ function createApp({ fetchGdeltImpl = fetchGdelt, fetchNewsImpl = fetchAllNews, 
                 if (!newsFetchedAt || Date.parse(now()) - Date.parse(newsFetchedAt) >= 5 * 60000) await refreshNews();
                 const gdelt = await fetchGdeltImpl();
                 const timestamp = now();
-                const sources = [...gdelt.sources,{ id:'rss',...newsHealth }];
-                const failed = sources.filter(s => s.status !== 'ok').length;
-                const status = sources.every(s => s.status === 'failed') ? 'failed' : failed ? 'partial' : 'ok';
+                const sources = [...gdelt.sources,{ id:'rss', status:newsHealth.status === 'ok' ? 'ok' : newsHealth.status, ...newsHealth }];
+                const failed = sources.filter(s => !['ok'].includes(s.status)).length;
+                const status = sources.every(s => ['failed','rate-limited','timeout'].includes(s.status)) ? 'failed' : failed ? 'partial' : 'ok';
                 if (status === 'failed') {
                     const alerts = advanceAlerts([],db.getState('alertState',{}),{ successful:false, now:timestamp });
                     db.setState('alertState',alerts.state);
+                    db.storeCycle({ articles:[], situations:[], pipelineVersion:VERSION },{ status,sources },alerts.state,[],timestamp,gdelt.providerResponses || []);
                     latest = { ...latest, health:{ status,sources } }; db.setState('latest',latest);
                     broadcast({ type:'activities_update',...envelope() }); return envelope();
                 }
@@ -142,7 +169,7 @@ function createApp({ fetchGdeltImpl = fetchGdelt, fetchNewsImpl = fetchAllNews, 
                 }
                 const alerts = advanceAlerts(result.situations,db.getState('alertState',{}),{ successful:status === 'ok', now:timestamp });
                 const health = { status,sources };
-                db.storeCycle(result,health,alerts.state,alerts.alerts,timestamp);
+                db.storeCycle(result,health,alerts.state,alerts.alerts,timestamp,gdelt.providerResponses || []);
                 latest = { situations:result.situations, health, recordedAt:timestamp };
                 broadcast({ type:'activities_update',...envelope() });
                 if (alerts.alerts.length) broadcast({ type:'escalation',escalations:alerts.alerts });

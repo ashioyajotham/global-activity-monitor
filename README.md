@@ -19,6 +19,10 @@ default.
 Run the regression suite with `npm test`. The offline ML workflow is documented
 in `ml/train.py`; it requires `scikit-learn` from `ml/requirements-lock.txt`.
 
+The sections below describe the earlier v4 architecture and are retained as
+historical context. For current behavior, use the evidence pipeline contract
+above and the versioned API responses (`pipelineVersion: evidence-v1`).
+
 A real-time geopolitical situation tracker that autonomously discovers, scores, and visualises active global events on an interactive world map. No hardcoded watchlists, no manual configuration. The system observes global data feeds, clusters events by geographic proximity, and surfaces the situations that matter.
 
 ---
